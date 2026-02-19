@@ -5,7 +5,7 @@
          http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.bauman.iu5</groupId>
+    <groupId>ru.bauman.iu5</groupId>
     <artifactId>brp-messenger</artifactId>
     <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
@@ -13,7 +13,7 @@
     <properties>
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <javafx.version>21.0.5</javafx.version>
+        <javafx.version>21.0.10</javafx.version>
     </properties>
 
     <dependencies>
@@ -37,7 +37,7 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.4.0</version>
                 <configuration>
-                    <mainClass>com.bauman.iu5.brp.BRPNodeApp</mainClass>
+                    <mainClass>ru.bauman.iu5.brp.BRPNodeApp</mainClass>
                 </configuration>
             </plugin>
         </plugins>
