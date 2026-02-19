@@ -1,4 +1,4 @@
-package com.bauman.iu5.brp;
+package ru.bauman.iu5.brp;
 
 import javafx.application.Application;
 import javafx.scene.Scene;
