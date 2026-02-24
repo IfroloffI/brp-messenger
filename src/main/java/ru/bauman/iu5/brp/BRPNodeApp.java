@@ -1,16 +1,16 @@
 package ru.bauman.iu5.brp;
 
 import javafx.application.Application;
-import ru.bauman.iu5.brp.ui.MainUI;
-import ru.bauman.iu5.brp.api.BRPService;
+import ru.bauman.iu5.brp.ui.MainWindow;
 
 public class BRPNodeApp {
+
     public static void main(String[] args) {
-        // Тест singleton API
-        BRPService service = BRPService.getInstance();
-        System.out.println("Main: " + service.getNodeStatus());
+        System.out.println("BRP Messenger v1.0 (ИУ5-62Б)");
+        System.out.println("Архитектура: OSI + Clean Architecture");
+        System.out.println("Структура готова к реализации");
 
         // Запуск UI
-        Application.launch(MainUI.class, args);
+        Application.launch(MainWindow.class, args);
     }
 }
