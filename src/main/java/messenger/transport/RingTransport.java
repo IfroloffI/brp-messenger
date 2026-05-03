@@ -68,7 +68,6 @@ public final class RingTransport implements AutoCloseable {
     public void start() throws IOException {
         running = true;
         serverSocket = new ServerSocket(tcpPort);
-        LOG.info(prefix() + " [TRANSPORT] listening | bind=0.0.0.0:" + tcpPort);
         executor.execute(this::acceptLoop);
     }
 
@@ -145,7 +144,6 @@ public final class RingTransport implements AutoCloseable {
         while (running) {
             try {
                 Socket socket = serverSocket.accept();
-                LOG.info(prefix() + " [TRANSPORT] accepted | remoteAddr=" + socket.getRemoteSocketAddress());
                 executor.execute(() -> handleAccepted(socket));
             } catch (IOException ex) {
                 if (running) {
@@ -245,16 +243,13 @@ public final class RingTransport implements AutoCloseable {
                 }
                 markSeen(message.messageId());
 
-                LOG.info(prefix() + " [TRANSPORT] received | fromId=" + message.senderId() + " | seq="
-                        + message.sequenceNumber() + " | targetId=" + targetIdToLog(message.targetId())
-                        + " | payloadLength=" + message.payload().length());
-
                 boolean forMe = message.targetId() == ringState.myId();
                 boolean isBroadcast = message.targetId() == ChatMessage.TARGET_BROADCAST;
                 if (forMe || isBroadcast) {
                     onLocalDeliver.accept(message);
                     LOG.info(prefix() + " [TRANSPORT] deliver local | fromId=" + message.senderId()
-                            + " | seq=" + message.sequenceNumber());
+                            + " | seq=" + message.sequenceNumber() + " | targetId="
+                            + targetIdToLog(message.targetId()) + " | payloadLength=" + message.payload().length());
                 }
 
                 if (!forMe) {
@@ -281,8 +276,6 @@ public final class RingTransport implements AutoCloseable {
             synchronized (this) {
                 message.writeTo(output);
             }
-            LOG.info(prefix() + " [TRANSPORT] forward | fromId=" + message.senderId()
-                    + " | seq=" + message.sequenceNumber() + " | targetId=" + targetIdToLog(message.targetId()));
         } catch (IOException ex) {
             LOG.warning(prefix() + " [TRANSPORT] forward failed | reason=" + ex.getMessage());
             enqueueForRight(message);
@@ -313,16 +306,25 @@ public final class RingTransport implements AutoCloseable {
             return;
         }
         LOG.info(prefix() + " [QUEUE] drain start | neighborId=" + neighborId + " | pending=" + pending);
+        int drained = 0;
 
         while (running) {
             OutboundMessage message = outboxStore.peek(neighborId);
             if (message == null) {
-                LOG.info(prefix() + " [QUEUE] drain stop | neighborId=" + neighborId + " | reason=empty");
+                if (drained > 0) {
+                    LOG.info(prefix() + " [QUEUE] drain done | neighborId=" + neighborId + " | sent=" + drained);
+                }
                 return;
             }
             DataOutputStream output = rightOutput;
             if (output == null) {
-                LOG.info(prefix() + " [QUEUE] drain stop | neighborId=" + neighborId + " | reason=right unavailable");
+                if (drained > 0) {
+                    LOG.info(prefix() + " [QUEUE] drain paused | neighborId=" + neighborId + " | sent=" + drained
+                            + " | reason=right unavailable");
+                } else {
+                    LOG.info(prefix() + " [QUEUE] drain skipped | neighborId=" + neighborId
+                            + " | reason=right unavailable");
+                }
                 return;
             }
             try {
@@ -330,8 +332,7 @@ public final class RingTransport implements AutoCloseable {
                     message.toChatMessage().writeTo(output);
                 }
                 outboxStore.poll(neighborId);
-                LOG.info(prefix() + " [QUEUE] sent and removed | neighborId=" + neighborId + " | msgId="
-                        + message.messageId() + " | remaining=" + outboxStore.size(neighborId));
+                drained++;
             } catch (IOException ex) {
                 LOG.warning(prefix() + " [QUEUE] drain stop | neighborId=" + neighborId
                         + " | reason=" + ex.getMessage());
