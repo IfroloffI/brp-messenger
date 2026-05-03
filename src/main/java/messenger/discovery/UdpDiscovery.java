@@ -104,7 +104,6 @@ public final class UdpDiscovery implements Closeable {
                 datagramPacket.setAddress(subnetBc);
                 socket.send(datagramPacket);
             }
-            LOG.info(logPrefix(myId) + " [DISCOVERY] broadcast sent | myIp=" + myIp + " | myNodeId=" + myId);
         } catch (IOException ex) {
             LOG.warning("[DISCOVERY] broadcast failed | reason=" + ex.getMessage());
         }
@@ -153,6 +152,7 @@ public final class UdpDiscovery implements Closeable {
                             }
                         }
 
+                        InetAddress previousIpForId = liveNodes.get(nodeId);
                         for (var it = liveNodes.entrySet().iterator(); it.hasNext(); ) {
                             var e = it.next();
                             if (e.getValue().equals(ip) && e.getKey() != nodeId) {
@@ -162,9 +162,10 @@ public final class UdpDiscovery implements Closeable {
                         }
                         liveNodes.put(nodeId, ip);
                         lastSeenMs.put(nodeId, now);
-                        LOG.info(logPrefix(myId.get()) + " [DISCOVERY] received | fromIp="
-                                + ip.getHostAddress() + " | fromNodeId=" + nodeId + " | rawSize=" + packet.getLength());
-                        logLiveNodes();
+                        if (previousIpForId == null || !previousIpForId.equals(ip)) {
+                            LOG.info(logPrefix(myId.get()) + " [DISCOVERY] peer | nodeId=" + nodeId
+                                    + " | ip=" + ip.getHostAddress());
+                        }
                     } catch (UnknownHostException ex) {
                         LOG.warning(logPrefix(myId.get()) + " [DISCOVERY] invalid ip in packet | value="
                                 + parsed.ip());
@@ -189,7 +190,7 @@ public final class UdpDiscovery implements Closeable {
         } catch (RuntimeException ex) {
             LOG.warning(logPrefix(newId) + " [DISCOVERY] failed to persist new id | reason=" + ex.getMessage());
         }
-        LOG.warning(logPrefix(newId) + " [DISCOVERY] duplicate nodeId collision | otherIp=" + otherIp.getHostAddress()
+        LOG.info(logPrefix(newId) + " [DISCOVERY] duplicate nodeId collision | otherIp=" + otherIp.getHostAddress()
                 + " | remapped " + oldId + " -> " + newId + " (larger local IP yields new id)");
         BiConsumer<Long, Long> listener = onIdRemapped;
         if (listener != null) {
@@ -239,15 +240,9 @@ public final class UdpDiscovery implements Closeable {
                 if (removedIp != null) {
                     LOG.info(logPrefix(myId) + " [DISCOVERY] node timed out | nodeId=" + nodeId
                             + " | lastSeenIp=" + removedIp.getHostAddress());
-                    logLiveNodes();
                 }
             }
         }
-    }
-
-    private void logLiveNodes() {
-        long myId = this.myId.get();
-        LOG.info(logPrefix(myId) + " [DISCOVERY] live nodes: " + liveNodes.size() + " | ids=" + liveNodes.keySet());
     }
 
     private String logPrefix(long myId) {

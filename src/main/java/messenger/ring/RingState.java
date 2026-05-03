@@ -74,7 +74,6 @@ public final class RingState {
         rightNeighbor = newRight;
         if (changed) {
             LOG.info(logPrefix() + " [RING] neighbors updated | left=" + newLeft + " | right=" + newRight);
-            logState("recomputed");
         }
     }
 
