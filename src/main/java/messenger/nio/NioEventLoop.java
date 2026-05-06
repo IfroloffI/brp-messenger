@@ -8,10 +8,10 @@ import java.util.concurrent.*;
 /**
  * Главный NIO event loop на базе Selector.
  * Обрабатывает все сетевые события в одном потоке.
- *
- * Thread-safety:
- * - register() может быть вызван из любого потока
- * - execute() thread-safe для отложенных задач
+ * <p>
+ * * Thread-safety:
+ * * - register() может быть вызван из любого потока
+ * * - execute() thread-safe для отложенных задач
  */
 public final class NioEventLoop implements Runnable, AutoCloseable {
 
@@ -29,19 +29,10 @@ public final class NioEventLoop implements Runnable, AutoCloseable {
         this.running = false;
     }
 
-    /**
-     * Получить Selector для обновления interestOps.
-     * ВАЖНО: Используйте только из NIO потока или через execute()!
-     */
     public Selector getSelector() {
         return selector;
     }
 
-    /**
-     * Запуск event loop.
-     *
-     * @throws IllegalStateException если уже запущен
-     */
     public void start() {
         if (running) {
             throw new IllegalStateException("EventLoop already running");
@@ -51,24 +42,14 @@ public final class NioEventLoop implements Runnable, AutoCloseable {
         System.out.println("[NIO] Event loop started on thread: " + eventLoopThread.getName());
     }
 
-    /**
-     * Регистрация канала с обработчиком.
-     * Thread-safe: можно вызывать из любого потока.
-     *
-     * @param channel SelectableChannel для регистрации
-     * @param ops     Interest ops (OP_ACCEPT, OP_CONNECT, OP_READ, OP_WRITE)
-     * @param handler Обработчик событий
-     */
     public void register(SelectableChannel channel, int ops, ChannelHandler handler) throws IOException {
         channel.configureBlocking(false);
 
-        // Если вызываем из NIO потока - регистрируем сразу
         if (Thread.currentThread() == eventLoopThread) {
             SelectionKey key = channel.register(selector, ops);
             key.attach(handler);
             handlers.put(channel, handler);
         } else {
-            // Иначе - откладываем на следующий цикл
             execute(() -> {
                 try {
                     SelectionKey key = channel.register(selector, ops);
@@ -78,48 +59,35 @@ public final class NioEventLoop implements Runnable, AutoCloseable {
                     System.err.println("[NIO] Failed to register channel: " + e.getMessage());
                 }
             });
-            selector.wakeup(); // Прерываем select() для обработки pending task
+            selector.wakeup();
         }
     }
 
-    /**
-     * Выполнение задачи в NIO потоке.
-     * Thread-safe: можно вызывать из любого потока.
-     *
-     * @param task Runnable для выполнения
-     */
     public void execute(Runnable task) {
         pendingTasks.offer(task);
         selector.wakeup();
     }
 
-    /**
-     * Главный цикл обработки событий.
-     * Выполняется в отдельном потоке.
-     */
     @Override
     public void run() {
         System.out.println("[NIO] Event loop running...");
 
         while (running) {
             try {
-                // 1. Выполняем отложенные задачи
                 processPendingTasks();
 
-                // 2. Блокируемся до появления событий (timeout 1 сек)
                 int readyChannels = selector.select(1000);
 
                 if (readyChannels == 0) {
-                    continue; // Таймаут, проверяем running и pending tasks
+                    continue;
                 }
 
-                // 3. Обрабатываем готовые каналы
                 Set<SelectionKey> selectedKeys = selector.selectedKeys();
                 Iterator<SelectionKey> keyIterator = selectedKeys.iterator();
 
                 while (keyIterator.hasNext()) {
                     SelectionKey key = keyIterator.next();
-                    keyIterator.remove(); // Важно: удаляем обработанный ключ
+                    keyIterator.remove();
 
                     if (!key.isValid()) {
                         continue;
@@ -132,7 +100,6 @@ public final class NioEventLoop implements Runnable, AutoCloseable {
                     }
 
                     try {
-                        // Обрабатываем события в порядке приоритета
                         if (key.isAcceptable()) {
                             handler.handleAccept(key);
                         }
@@ -149,7 +116,6 @@ public final class NioEventLoop implements Runnable, AutoCloseable {
                         System.err.println("[NIO] Error handling event: " + e.getMessage());
                         e.printStackTrace();
 
-                        // Уведомляем handler об ошибке и закрываем канал
                         try {
                             handler.handleError(key, e);
                         } catch (Exception handlerError) {
@@ -171,9 +137,6 @@ public final class NioEventLoop implements Runnable, AutoCloseable {
         System.out.println("[NIO] Event loop stopped");
     }
 
-    /**
-     * Обработка отложенных задач.
-     */
     private void processPendingTasks() {
         Runnable task;
         int processed = 0;
@@ -193,10 +156,6 @@ public final class NioEventLoop implements Runnable, AutoCloseable {
         }
     }
 
-    /**
-     * Остановка event loop.
-     * Блокирует до завершения потока (max 5 сек).
-     */
     public void stop() {
         if (!running) {
             return;

@@ -1,43 +1,73 @@
 package messenger.protocol;
 
-import java.nio.charset.StandardCharsets;
-import java.util.Optional;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
 
-public final class DiscoveryPacket {
-    public static final String TYPE = "BEACON";
+/**
+ * UDP пакет для автоматического обнаружения узлов.
+ * <p>
+ * Формат (16 байт):
+ * - nodeId: 8 байт (long)
+ * - IP address: 4 байта (IPv4)
+ * - TCP port: 4 байта (int)
+ */
+public record DiscoveryPacket(
+        long nodeId,
+        InetAddress ipAddress,
+        int tcpPort
+) {
+    /**
+     * Сериализация в ByteBuffer.
+     *
+     * @return ByteBuffer готовый к отправке (position=0, limit=16)
+     */
+    public ByteBuffer toByteBuffer() {
+        byte[] ipBytes = ipAddress.getAddress();
 
-    private final long nodeId;
-    private final String ip;
-
-    public DiscoveryPacket(long nodeId, String ip) {
-        this.nodeId = nodeId;
-        this.ip = ip;
-    }
-
-    public long nodeId() {
-        return nodeId;
-    }
-
-    public String ip() {
-        return ip;
-    }
-
-    public byte[] toBytes() {
-        String payload = TYPE + "|" + nodeId + "|" + ip;
-        return payload.getBytes(StandardCharsets.UTF_8);
-    }
-
-    public static Optional<DiscoveryPacket> fromBytes(byte[] bytes, int length) {
-        try {
-            String payload = new String(bytes, 0, length, StandardCharsets.UTF_8).trim();
-            String[] parts = payload.split("\\|", 3);
-            if (parts.length != 3 || !TYPE.equals(parts[0])) {
-                return Optional.empty();
-            }
-            long id = Long.parseLong(parts[1]);
-            return Optional.of(new DiscoveryPacket(id, parts[2]));
-        } catch (RuntimeException ex) {
-            return Optional.empty();
+        if (ipBytes.length != 4) {
+            throw new IllegalStateException("Only IPv4 is supported");
         }
+
+        ByteBuffer buffer = ByteBuffer.allocate(16);
+        buffer.putLong(nodeId);
+        buffer.put(ipBytes);
+        buffer.putInt(tcpPort);
+
+        buffer.flip();
+        return buffer;
+    }
+
+    /**
+     * Десериализация из ByteBuffer.
+     *
+     * @param buffer ByteBuffer с данными (минимум 16 байт)
+     * @return DiscoveryPacket или null при ошибке
+     */
+    public static DiscoveryPacket fromByteBuffer(ByteBuffer buffer) {
+        try {
+            if (buffer.remaining() < 16) {
+                return null;
+            }
+
+            long nodeId = buffer.getLong();
+
+            byte[] ipBytes = new byte[4];
+            buffer.get(ipBytes);
+            InetAddress ipAddress = InetAddress.getByAddress(ipBytes);
+
+            int tcpPort = buffer.getInt();
+
+            return new DiscoveryPacket(nodeId, ipAddress, tcpPort);
+
+        } catch (Exception e) {
+            System.err.println("[DiscoveryPacket] Parse error: " + e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public String toString() {
+        return String.format("DiscoveryPacket[nodeId=%d, ip=%s, port=%d]",
+                nodeId, ipAddress.getHostAddress(), tcpPort);
     }
 }

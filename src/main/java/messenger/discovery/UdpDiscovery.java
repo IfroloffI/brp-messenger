@@ -35,7 +35,6 @@ public final class UdpDiscovery implements AutoCloseable {
     private InetAddress broadcastAddress;
     private volatile boolean running;
 
-    // Scheduler для периодических задач
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "UdpDiscovery-Scheduler");
@@ -49,33 +48,25 @@ public final class UdpDiscovery implements AutoCloseable {
         this.eventLoop = eventLoop;
     }
 
-    /**
-     * Запуск discovery.
-     */
     public void start() throws IOException {
         running = true;
 
-        // Открываем UDP канал
         channel = DatagramChannel.open(StandardProtocolFamily.INET);
         channel.configureBlocking(false);
         channel.setOption(StandardSocketOptions.SO_BROADCAST, true);
         channel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
 
-        // Bind на discovery порт
         channel.bind(new InetSocketAddress(DISCOVERY_PORT));
 
-        // Получаем broadcast адрес
         broadcastAddress = InetAddress.getByName("255.255.255.255");
 
-        // Регистрируем в event loop
         eventLoop.register(channel, SelectionKey.OP_READ, new DiscoveryHandler());
 
         System.out.println("[UdpDiscovery] Started on port " + DISCOVERY_PORT + " (NIO mode)");
 
-        // Запускаем периодические задачи ПОСЛЕ инициализации канала
         scheduler.scheduleAtFixedRate(
                 this::sendBeacon,
-                1000, // Задержка 1 сек для инициализации
+                1000,
                 BEACON_INTERVAL_MS,
                 TimeUnit.MILLISECONDS
         );
@@ -88,31 +79,24 @@ public final class UdpDiscovery implements AutoCloseable {
         );
     }
 
-    /**
-     * Отправка beacon сообщения.
-     */
     private void sendBeacon() {
         if (!running || channel == null || !channel.isOpen()) {
             return;
         }
 
         try {
-            // Создаём пакет
             DiscoveryPacket packet = new DiscoveryPacket(
                     ringState.myId(),
                     getLocalIpAddress(),
                     tcpPort
             );
 
-            // Сериализуем в ByteBuffer
-            ByteBuffer buffer = serializePacket(packet);
+            ByteBuffer buffer = packet.toByteBuffer();
             InetSocketAddress destination = new InetSocketAddress(broadcastAddress, DISCOVERY_PORT);
 
-            // Отправляем через NIO event loop
             eventLoop.execute(() -> {
                 try {
                     if (channel != null && channel.isOpen()) {
-                        // ВАЖНО: перематываем buffer перед отправкой
                         buffer.rewind();
                         int sent = channel.send(buffer, destination);
 
@@ -132,29 +116,6 @@ public final class UdpDiscovery implements AutoCloseable {
         }
     }
 
-    /**
-     * Сериализация DiscoveryPacket в ByteBuffer.
-     * <p>
-     * Формат:
-     * - nodeId (8 bytes)
-     * - IP address (4 bytes для IPv4)
-     * - TCP port (4 bytes)
-     */
-    private ByteBuffer serializePacket(DiscoveryPacket packet) {
-        byte[] ipBytes = packet.ipAddress().getAddress();
-
-        ByteBuffer buffer = ByteBuffer.allocate(8 + 4 + 4);
-        buffer.putLong(packet.nodeId());
-        buffer.put(ipBytes);
-        buffer.putInt(packet.tcpPort());
-
-        buffer.flip();
-        return buffer;
-    }
-
-    /**
-     * Cleanup устаревших узлов.
-     */
     private void cleanupTimeouts() {
         if (!running) {
             return;
@@ -170,9 +131,6 @@ public final class UdpDiscovery implements AutoCloseable {
         }
     }
 
-    /**
-     * Handler для входящих UDP пакетов.
-     */
     private class DiscoveryHandler implements ChannelHandler {
 
         private final ByteBuffer receiveBuffer = ByteBuffer.allocate(1024);
@@ -193,13 +151,12 @@ public final class UdpDiscovery implements AutoCloseable {
             SocketAddress sender = dgChannel.receive(receiveBuffer);
 
             if (sender == null) {
-                return; // Нет данных
+                return;
             }
 
             receiveBuffer.flip();
 
-            // Парсим пакет
-            DiscoveryPacket packet = deserializePacket(receiveBuffer);
+            DiscoveryPacket packet = DiscoveryPacket.fromByteBuffer(receiveBuffer);
             if (packet == null) {
                 System.err.println("[UdpDiscovery] Failed to parse packet from " + sender);
                 return;
@@ -211,59 +168,29 @@ public final class UdpDiscovery implements AutoCloseable {
             handleDiscoveryPacket(packet, sender);
         }
 
-        /**
-         * Десериализация ByteBuffer в DiscoveryPacket.
-         */
-        private DiscoveryPacket deserializePacket(ByteBuffer buffer) {
-            try {
-                if (buffer.remaining() < 16) {
-                    return null; // Недостаточно данных
-                }
-
-                long nodeId = buffer.getLong();
-
-                byte[] ipBytes = new byte[4];
-                buffer.get(ipBytes);
-                InetAddress ipAddress = InetAddress.getByAddress(ipBytes);
-
-                int tcpPort = buffer.getInt();
-
-                return new DiscoveryPacket(nodeId, ipAddress, tcpPort);
-
-            } catch (Exception e) {
-                System.err.println("[UdpDiscovery] Deserialization error: " + e.getMessage());
-                return null;
-            }
-        }
-
         private void handleDiscoveryPacket(DiscoveryPacket packet, SocketAddress sender) {
             long remoteId = packet.nodeId();
             InetAddress remoteIp = packet.ipAddress();
             int remoteTcpPort = packet.tcpPort();
 
-            // Игнорируем свои пакеты
             if (remoteId == ringState.myId()) {
                 return;
             }
 
-            // Проверка конфликта nodeId
             if (ringState.hasNode(remoteId)) {
                 NodeInfo existing = ringState.getNode(remoteId);
                 if (existing != null && !existing.ip().equals(remoteIp)) {
-                    // Конфликт! Разрешаем по правилу: меньший nodeId побеждает
                     if (remoteId < ringState.myId()) {
                         System.err.println("[UdpDiscovery] NodeId conflict detected! Regenerating...");
                         regenerateNodeId();
                         return;
                     } else {
-                        // Игнорируем конфликтующий узел
                         System.out.println("[UdpDiscovery] Ignoring conflicting node: " + remoteId);
                         return;
                     }
                 }
             }
 
-            // Добавляем/обновляем узел
             NodeInfo node = new NodeInfo(remoteId, remoteIp, remoteTcpPort, System.currentTimeMillis());
             boolean added = ringState.addOrUpdateNode(node);
 
@@ -284,9 +211,6 @@ public final class UdpDiscovery implements AutoCloseable {
         }
     }
 
-    /**
-     * Регенерация nodeId при конфликте.
-     */
     private void regenerateNodeId() {
         try {
             long oldId = ringState.myId();
@@ -299,9 +223,6 @@ public final class UdpDiscovery implements AutoCloseable {
         }
     }
 
-    /**
-     * Получение локального IP адреса.
-     */
     private InetAddress getLocalIpAddress() throws IOException {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.connect(InetAddress.getByName("8.8.8.8"), 80);

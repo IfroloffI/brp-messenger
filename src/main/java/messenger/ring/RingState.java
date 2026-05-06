@@ -1,110 +1,197 @@
 package messenger.ring;
 
-import java.net.InetAddress;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.logging.Logger;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * Состояние кольцевой топологии.
+ * <p>
+ * Thread-safe: все операции синхронизированы.
+ */
 public final class RingState {
-    private static final Logger LOG = Logger.getLogger(RingState.class.getName());
 
-    private volatile long myId;
+    private final AtomicLong myNodeId;
+    private final Map<Long, NodeInfo> nodes;
 
-    private volatile NodeInfo leftNeighbor;
-    private volatile NodeInfo rightNeighbor;
-
-    public RingState(long myId) {
-        this.myId = myId;
+    public RingState() {
+        this.myNodeId = new AtomicLong(generateNodeId());
+        this.nodes = new ConcurrentHashMap<>();
     }
 
+    /**
+     * Получить ID текущего узла.
+     */
     public long myId() {
-        return myId;
+        return myNodeId.get();
     }
 
-    public void setMyId(long newId) {
-        long previous = this.myId;
-        if (newId == previous) {
-            return;
+    /**
+     * Регенерация nodeId (при конфликте).
+     */
+    public void regenerateMyId() {
+        long newId = generateNodeId();
+        myNodeId.set(newId);
+        System.out.println("[RingState] NodeId regenerated: " + newId);
+    }
+
+    /**
+     * Добавление или обновление узла.
+     *
+     * @param node Информация об узле
+     * @return true если узел новый, false если обновлён
+     */
+    public boolean addOrUpdateNode(NodeInfo node) {
+        boolean isNew = !nodes.containsKey(node.nodeId());
+        nodes.put(node.nodeId(), node);
+
+        if (isNew) {
+            System.out.println("[RingState] Added node: " + node);
+            rebuildRing();
         }
-        this.myId = newId;
-        LOG.info("[myId=" + newId + "] [RING] myId remapped | " + previous + " -> " + newId);
+
+        return isNew;
     }
 
-    public Optional<NodeInfo> leftNeighbor() {
-        return Optional.ofNullable(leftNeighbor);
+    /**
+     * Удаление устаревших узлов.
+     *
+     * @param timeoutMs Таймаут в миллисекундах
+     * @return Количество удалённых узлов
+     */
+    public int removeOldNodes(long timeoutMs) {
+        long now = System.currentTimeMillis();
+        int removed = 0;
+
+        Iterator<Map.Entry<Long, NodeInfo>> it = nodes.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<Long, NodeInfo> entry = it.next();
+            long lastSeen = entry.getValue().lastSeenMs();
+
+            if (now - lastSeen > timeoutMs) {
+                System.out.println("[RingState] Removing timed-out node: " + entry.getKey() +
+                        " (last seen " + (now - lastSeen) + "ms ago)");
+                it.remove();
+                removed++;
+            }
+        }
+
+        if (removed > 0) {
+            rebuildRing();
+        }
+
+        return removed;
     }
 
+    /**
+     * Проверка существования узла.
+     */
+    public boolean hasNode(long nodeId) {
+        return nodes.containsKey(nodeId);
+    }
+
+    /**
+     * Получение информации об узле.
+     */
+    public NodeInfo getNode(long nodeId) {
+        return nodes.get(nodeId);
+    }
+
+    /**
+     * Получение всех узлов.
+     */
+    public List<NodeInfo> getAllNodes() {
+        return new ArrayList<>(nodes.values());
+    }
+
+    /**
+     * Получение правого соседа (следующий по кольцу).
+     */
     public Optional<NodeInfo> rightNeighbor() {
-        return Optional.ofNullable(rightNeighbor);
+        List<Long> sortedIds = getSortedNodeIds();
+
+        if (sortedIds.isEmpty()) {
+            return Optional.empty();
+        }
+
+        long myId = myId();
+        int myIndex = sortedIds.indexOf(myId);
+
+        // Если нас нет в списке или мы одни
+        if (myIndex == -1 || sortedIds.size() == 1) {
+            return Optional.empty();
+        }
+
+        // Следующий по кольцу (с wraparound)
+        int rightIndex = (myIndex + 1) % sortedIds.size();
+        long rightId = sortedIds.get(rightIndex);
+
+        return Optional.ofNullable(nodes.get(rightId));
     }
 
-    public synchronized void recompute(Map<Long, InetAddress> liveNodes) {
-        InetAddress myIp = liveNodes.get(myId);
-        if (myIp == null) {
-            return;
+    /**
+     * Получение левого соседа (предыдущий по кольцу).
+     */
+    public Optional<NodeInfo> leftNeighbor() {
+        List<Long> sortedIds = getSortedNodeIds();
+
+        if (sortedIds.isEmpty()) {
+            return Optional.empty();
         }
 
-        List<Long> ids = new ArrayList<>(liveNodes.keySet());
-        ids.sort(Comparator.naturalOrder());
-        if (!ids.contains(myId)) {
-            return;
+        long myId = myId();
+        int myIndex = sortedIds.indexOf(myId);
+
+        if (myIndex == -1 || sortedIds.size() == 1) {
+            return Optional.empty();
         }
 
-        List<Long> ringOrder = buildRingOrder(ids);
-        if (ringOrder.size() <= 1) {
-            leftNeighbor = null;
-            rightNeighbor = null;
-            logState("single-node ring");
-            return;
-        }
+        // Предыдущий по кольцу (с wraparound)
+        int leftIndex = (myIndex - 1 + sortedIds.size()) % sortedIds.size();
+        long leftId = sortedIds.get(leftIndex);
 
-        int index = ringOrder.indexOf(myId);
-        int leftIndex = (index - 1 + ringOrder.size()) % ringOrder.size();
-        int rightIndex = (index + 1) % ringOrder.size();
-        long leftId = ringOrder.get(leftIndex);
-        long rightId = ringOrder.get(rightIndex);
-        NodeInfo newLeft = new NodeInfo(leftId, liveNodes.get(leftId));
-        NodeInfo newRight = new NodeInfo(rightId, liveNodes.get(rightId));
-
-        boolean changed = !equalsNeighbor(leftNeighbor, newLeft) || !equalsNeighbor(rightNeighbor, newRight);
-        leftNeighbor = newLeft;
-        rightNeighbor = newRight;
-        if (changed) {
-            LOG.info(logPrefix() + " [RING] neighbors updated | left=" + newLeft + " | right=" + newRight);
-        }
+        return Optional.ofNullable(nodes.get(leftId));
     }
 
-    private static List<Long> buildRingOrder(List<Long> sortedIds) {
-        long first = sortedIds.get(0);
-        List<Long> others = new ArrayList<>(sortedIds.subList(1, sortedIds.size()));
-        others.sort(Comparator.reverseOrder());
-
-        List<Long> result = new ArrayList<>();
-        result.add(first);
-        result.addAll(others);
-        return result;
+    /**
+     * Получение отсортированных ID узлов (включая себя).
+     */
+    private List<Long> getSortedNodeIds() {
+        List<Long> ids = new ArrayList<>(nodes.keySet());
+        ids.add(myId());
+        Collections.sort(ids);
+        return ids;
     }
 
-    private boolean equalsNeighbor(NodeInfo first, NodeInfo second) {
-        if (first == second) {
-            return true;
-        }
-        if (first == null || second == null) {
-            return false;
-        }
-        return first.nodeId() == second.nodeId() && first.ip().equals(second.ip());
+    /**
+     * Перестроение кольца (вызывается при изменении топологии).
+     */
+    private void rebuildRing() {
+        List<Long> sortedIds = getSortedNodeIds();
+        System.out.println("[RingState] Ring topology: " + sortedIds);
+
+        rightNeighbor().ifPresentOrElse(
+                right -> System.out.println("[RingState] Right neighbor: " + right.nodeId()),
+                () -> System.out.println("[RingState] No right neighbor")
+        );
+
+        leftNeighbor().ifPresentOrElse(
+                left -> System.out.println("[RingState] Left neighbor: " + left.nodeId()),
+                () -> System.out.println("[RingState] No left neighbor")
+        );
     }
 
-    public void logState(String reason) {
-        String left = leftNeighbor == null ? "null" : leftNeighbor.nodeId() + "(" + leftNeighbor.ip().getHostAddress() + ")";
-        String right = rightNeighbor == null ? "null" : rightNeighbor.nodeId() + "(" + rightNeighbor.ip().getHostAddress() + ")";
-        LOG.info(logPrefix() + " [RING] state | reason=" + reason + " | myId=" + myId + " | left=" + left + " | right=" + right);
+    /**
+     * Генерация нового nodeId на основе timestamp и random.
+     */
+    private static long generateNodeId() {
+        return System.currentTimeMillis() + new Random().nextInt(10000);
     }
 
-    private String logPrefix() {
-        return "[myId=" + myId + "]";
+    /**
+     * Количество известных узлов (не считая себя).
+     */
+    public int nodeCount() {
+        return nodes.size();
     }
 }
