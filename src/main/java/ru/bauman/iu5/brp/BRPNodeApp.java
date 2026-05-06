@@ -1,16 +1,30 @@
 package ru.bauman.iu5.brp;
 
 import javafx.application.Application;
+import ru.bauman.iu5.brp.api.ApplicationApi;
+import ru.bauman.iu5.brp.api.dto.NetworkException;
+import ru.bauman.iu5.brp.api.mock.MockApplicationApi;
 import ru.bauman.iu5.brp.ui.MainWindow;
 
 public class BRPNodeApp {
+    private static ApplicationApi api;
 
     public static void main(String[] args) {
-        System.out.println("BRP Messenger v1.0 (ИУ5-62Б)");
-        System.out.println("Архитектура: OSI + Clean Architecture");
-        System.out.println("Структура готова к реализации");
+        try {
+            api = new MockApplicationApi();
 
-        // Запуск UI
+            try {
+                api.start(5000, true);
+            } catch (NetworkException e) {
+                System.err.println("x Ошибка запуска: " + e.getMessage());
+                System.exit(1);
+            }
+        } catch (Exception e) {
+            // Общая обработка
+        }
+
+        MainWindow.setApplicationApi(api);
+
         Application.launch(MainWindow.class, args);
     }
 }
