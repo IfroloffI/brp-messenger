@@ -1,79 +1,78 @@
 package messenger.protocol;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.Objects;
+import java.nio.ByteBuffer;
 
-public final class ChatMessage {
+/**
+ * Сообщение чата в кольцевой топологии.
+ * <p>
+ * Record класс для immutable сообщений.
+ * Содержит методы сериализации для NIO.
+ */
+public record ChatMessage(
+        String messageId,
+        long sequenceNumber,
+        long senderId,
+        long targetId,
+        String payload
+) {
+    /**
+     * Специальный targetId для broadcast сообщений.
+     */
     public static final long TARGET_BROADCAST = -1L;
 
-    private final String messageId;
-    private final long sequenceNumber;
-    private final long senderId;
-    private final long targetId;
-    private final String payload;
-
-    public ChatMessage(String messageId, long sequenceNumber, long senderId, long targetId, String payload) {
-        this.messageId = Objects.requireNonNull(messageId, "messageId");
-        this.sequenceNumber = sequenceNumber;
-        this.senderId = senderId;
-        this.targetId = targetId;
-        this.payload = Objects.requireNonNull(payload, "payload");
-    }
-
-    public String messageId() {
-        return messageId;
-    }
-
-    public long sequenceNumber() {
-        return sequenceNumber;
-    }
-
-    public long senderId() {
-        return senderId;
-    }
-
-    public long targetId() {
-        return targetId;
-    }
-
-    public String payload() {
-        return payload;
-    }
-
+    /**
+     * Генерация messageId из senderId и sequenceNumber.
+     *
+     * @param senderId       ID отправителя
+     * @param sequenceNumber Порядковый номер сообщения
+     * @return Уникальный messageId
+     */
     public static String buildMessageId(long senderId, long sequenceNumber) {
-        return senderId + "-" + sequenceNumber;
+        return senderId + ":" + sequenceNumber;
     }
 
-    public void writeTo(DataOutputStream outputStream) throws IOException {
-        byte[] messageIdBytes = messageId.getBytes(StandardCharsets.UTF_8);
-        byte[] payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
-
-        outputStream.writeInt(messageIdBytes.length);
-        outputStream.write(messageIdBytes);
-        outputStream.writeLong(sequenceNumber);
-        outputStream.writeLong(senderId);
-        outputStream.writeLong(targetId);
-        outputStream.writeInt(payloadBytes.length);
-        outputStream.write(payloadBytes);
-        outputStream.flush();
+    /**
+     * Сериализация сообщения в ByteBuffer для NIO.
+     *
+     * @return ByteBuffer готовый для записи в канал
+     */
+    public ByteBuffer toByteBuffer() {
+        return MessageCodec.encode(this);
     }
 
-    public static ChatMessage readFrom(DataInputStream inputStream) throws IOException {
-        int messageIdLength = inputStream.readInt();
-        byte[] messageIdBytes = inputStream.readNBytes(messageIdLength);
-        String messageId = new String(messageIdBytes, StandardCharsets.UTF_8);
+    /**
+     * Десериализация сообщения из ByteBuffer.
+     *
+     * @param buffer ByteBuffer с данными
+     * @return ChatMessage или null если недостаточно данных
+     */
+    public static ChatMessage fromByteBuffer(ByteBuffer buffer) {
+        return MessageCodec.decode(buffer);
+    }
 
-        long sequenceNumber = inputStream.readLong();
-        long senderId = inputStream.readLong();
-        long targetId = inputStream.readLong();
+    /**
+     * Проверка является ли сообщение broadcast.
+     *
+     * @return true если сообщение для всех узлов
+     */
+    public boolean isBroadcast() {
+        return targetId == TARGET_BROADCAST;
+    }
 
-        int payloadLength = inputStream.readInt();
-        byte[] payloadBytes = inputStream.readNBytes(payloadLength);
-        String payload = new String(payloadBytes, StandardCharsets.UTF_8);
+    /**
+     * Проверка является ли сообщение для конкретного узла.
+     *
+     * @param nodeId ID узла для проверки
+     * @return true если сообщение адресовано этому узлу
+     */
+    public boolean isFor(long nodeId) {
+        return targetId == nodeId || isBroadcast();
+    }
 
-        return new ChatMessage(messageId, sequenceNumber, senderId, targetId, payload);
+    @Override
+    public String toString() {
+        return String.format("ChatMessage[id=%s, seq=%d, from=%d, to=%d, payload='%s']",
+                messageId, sequenceNumber, senderId, targetId,
+                payload.length() > 50 ? payload.substring(0, 50) + "..." : payload);
     }
 }
