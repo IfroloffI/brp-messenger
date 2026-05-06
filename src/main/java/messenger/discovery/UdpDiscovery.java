@@ -1,260 +1,339 @@
 package messenger.discovery;
 
+import messenger.nio.*;
 import messenger.protocol.DiscoveryPacket;
+import messenger.ring.*;
 
-import java.io.Closeable;
 import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.InterfaceAddress;
-import java.net.NetworkInterface;
-import java.net.SocketException;
-import java.net.SocketTimeoutException;
-import java.net.UnknownHostException;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.BiConsumer;
-import java.util.function.Consumer;
-import java.util.function.Supplier;
-import java.util.logging.Logger;
+import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.util.*;
+import java.util.concurrent.*;
 
-public final class UdpDiscovery implements Closeable {
-    private static final Logger LOG = Logger.getLogger(UdpDiscovery.class.getName());
+/**
+ * UDP Discovery на NIO для автоматического обнаружения узлов в сети.
+ * <p>
+ * Особенности:
+ * - Broadcast beacon каждые 2 секунды
+ * - Cleanup таймаутов каждую секунду
+ * - Разрешение конфликтов nodeId
+ * - Все I/O операции через NioEventLoop
+ */
+public final class UdpDiscovery implements AutoCloseable {
 
-    private final int udpPort;
-    private final long nodeTimeoutMs;
-    private final AtomicLong myId;
-    private final Supplier<InetAddress> localIpSupplier;
-    private final Consumer<Long> persistNodeId;
-    /** Bind socket to this IPv4 so broadcast uses the same NIC as our advertised IP. */
-    private final InetAddress discoveryBindAddress;
+    private static final int DISCOVERY_PORT = 9999;
+    private static final int BEACON_INTERVAL_MS = 2000;
+    private static final int CLEANUP_INTERVAL_MS = 1000;
+    private static final int NODE_TIMEOUT_MS = 10_000;
 
-    private final Map<Long, InetAddress> liveNodes = new ConcurrentHashMap<>();
-    private final Map<Long, Long> lastSeenMs = new ConcurrentHashMap<>();
+    private final RingState ringState;
+    private final int tcpPort;
+    private final NioEventLoop eventLoop;
 
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
-
-    private DatagramSocket socket;
+    private volatile DatagramChannel channel;
+    private InetAddress broadcastAddress;
     private volatile boolean running;
-    private volatile BiConsumer<Long, Long> onIdRemapped;
 
-    public UdpDiscovery(
-            int udpPort,
-            long nodeTimeoutMs,
-            AtomicLong myId,
-            Supplier<InetAddress> localIpSupplier,
-            Consumer<Long> persistNodeId,
-            InetAddress discoveryBindAddress
-    ) {
-        this.udpPort = udpPort;
-        this.nodeTimeoutMs = nodeTimeoutMs;
-        this.myId = myId;
-        this.localIpSupplier = localIpSupplier;
-        this.persistNodeId = persistNodeId;
-        this.discoveryBindAddress = discoveryBindAddress;
+    // Scheduler для периодических задач
+    private final ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "UdpDiscovery-Scheduler");
+                t.setDaemon(true);
+                return t;
+            });
+
+    public UdpDiscovery(RingState ringState, int tcpPort, NioEventLoop eventLoop) {
+        this.ringState = ringState;
+        this.tcpPort = tcpPort;
+        this.eventLoop = eventLoop;
     }
 
-    public void setOnIdRemapped(BiConsumer<Long, Long> listener) {
-        this.onIdRemapped = listener;
-    }
-
-    public void start() throws SocketException {
-        socket = new DatagramSocket(udpPort, discoveryBindAddress);
-        socket.setBroadcast(true);
-        socket.setSoTimeout(1_000);
+    /**
+     * Запуск discovery.
+     */
+    public void start() throws IOException {
         running = true;
 
-        scheduler.scheduleAtFixedRate(this::broadcastBeacon, 0, 2, TimeUnit.SECONDS);
-        scheduler.scheduleAtFixedRate(this::cleanupDeadNodes, 1, 1, TimeUnit.SECONDS);
-        scheduler.execute(this::listenLoop);
+        // Открываем UDP канал
+        channel = DatagramChannel.open(StandardProtocolFamily.INET);
+        channel.configureBlocking(false);
+        channel.setOption(StandardSocketOptions.SO_BROADCAST, true);
+        channel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+
+        // Bind на discovery порт
+        channel.bind(new InetSocketAddress(DISCOVERY_PORT));
+
+        // Получаем broadcast адрес
+        broadcastAddress = InetAddress.getByName("255.255.255.255");
+
+        // Регистрируем в event loop
+        eventLoop.register(channel, SelectionKey.OP_READ, new DiscoveryHandler());
+
+        System.out.println("[UdpDiscovery] Started on port " + DISCOVERY_PORT + " (NIO mode)");
+
+        // Запускаем периодические задачи ПОСЛЕ инициализации канала
+        scheduler.scheduleAtFixedRate(
+                this::sendBeacon,
+                1000, // Задержка 1 сек для инициализации
+                BEACON_INTERVAL_MS,
+                TimeUnit.MILLISECONDS
+        );
+
+        scheduler.scheduleAtFixedRate(
+                this::cleanupTimeouts,
+                CLEANUP_INTERVAL_MS,
+                CLEANUP_INTERVAL_MS,
+                TimeUnit.MILLISECONDS
+        );
     }
 
-    public Map<Long, InetAddress> snapshotLiveNodes() {
-        return Map.copyOf(liveNodes);
+    /**
+     * Отправка beacon сообщения.
+     */
+    private void sendBeacon() {
+        if (!running || channel == null || !channel.isOpen()) {
+            return;
+        }
+
+        try {
+            // Создаём пакет
+            DiscoveryPacket packet = new DiscoveryPacket(
+                    ringState.myId(),
+                    getLocalIpAddress(),
+                    tcpPort
+            );
+
+            // Сериализуем в ByteBuffer
+            ByteBuffer buffer = serializePacket(packet);
+            InetSocketAddress destination = new InetSocketAddress(broadcastAddress, DISCOVERY_PORT);
+
+            // Отправляем через NIO event loop
+            eventLoop.execute(() -> {
+                try {
+                    if (channel != null && channel.isOpen()) {
+                        // ВАЖНО: перематываем buffer перед отправкой
+                        buffer.rewind();
+                        int sent = channel.send(buffer, destination);
+
+                        if (sent > 0) {
+                            System.out.println("[UdpDiscovery] Beacon sent: nodeId=" +
+                                    ringState.myId() + ", bytes=" + sent);
+                        }
+                    }
+                } catch (IOException e) {
+                    System.err.println("[UdpDiscovery] Beacon send error: " + e.getMessage());
+                }
+            });
+
+        } catch (Exception e) {
+            System.err.println("[UdpDiscovery] Beacon preparation error: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 
-    private void broadcastBeacon() {
+    /**
+     * Сериализация DiscoveryPacket в ByteBuffer.
+     * <p>
+     * Формат:
+     * - nodeId (8 bytes)
+     * - IP address (4 bytes для IPv4)
+     * - TCP port (4 bytes)
+     */
+    private ByteBuffer serializePacket(DiscoveryPacket packet) {
+        byte[] ipBytes = packet.ipAddress().getAddress();
+
+        ByteBuffer buffer = ByteBuffer.allocate(8 + 4 + 4);
+        buffer.putLong(packet.nodeId());
+        buffer.put(ipBytes);
+        buffer.putInt(packet.tcpPort());
+
+        buffer.flip();
+        return buffer;
+    }
+
+    /**
+     * Cleanup устаревших узлов.
+     */
+    private void cleanupTimeouts() {
         if (!running) {
             return;
         }
+
         try {
-            long myId = this.myId.get();
-            if (myId == 0L) {
+            int removed = ringState.removeOldNodes(NODE_TIMEOUT_MS);
+            if (removed > 0) {
+                System.out.println("[UdpDiscovery] Cleaned up " + removed + " timed-out nodes");
+            }
+        } catch (Exception e) {
+            System.err.println("[UdpDiscovery] Cleanup error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Handler для входящих UDP пакетов.
+     */
+    private class DiscoveryHandler implements ChannelHandler {
+
+        private final ByteBuffer receiveBuffer = ByteBuffer.allocate(1024);
+
+        @Override
+        public void handleAccept(SelectionKey key) {
+        }
+
+        @Override
+        public void handleConnect(SelectionKey key) {
+        }
+
+        @Override
+        public void handleRead(SelectionKey key) throws IOException {
+            DatagramChannel dgChannel = (DatagramChannel) key.channel();
+
+            receiveBuffer.clear();
+            SocketAddress sender = dgChannel.receive(receiveBuffer);
+
+            if (sender == null) {
+                return; // Нет данных
+            }
+
+            receiveBuffer.flip();
+
+            // Парсим пакет
+            DiscoveryPacket packet = deserializePacket(receiveBuffer);
+            if (packet == null) {
+                System.err.println("[UdpDiscovery] Failed to parse packet from " + sender);
                 return;
             }
-            String myIp = localIpSupplier.get().getHostAddress();
-            DiscoveryPacket packet = new DiscoveryPacket(myId, myIp);
-            byte[] bytes = packet.toBytes();
-            InetAddress localForSend = localIpSupplier.get();
-            DatagramPacket datagramPacket = new DatagramPacket(bytes, bytes.length);
-            datagramPacket.setPort(udpPort);
 
-            datagramPacket.setAddress(InetAddress.getByName("255.255.255.255"));
-            socket.send(datagramPacket);
+            System.out.println("[UdpDiscovery] Received from " + sender +
+                    ": nodeId=" + packet.nodeId() + ", ip=" + packet.ipAddress().getHostAddress());
 
-            InetAddress subnetBc = subnetBroadcastFor(localForSend);
-            if (subnetBc != null
-                    && !subnetBc.equals(datagramPacket.getAddress())) {
-                datagramPacket.setAddress(subnetBc);
-                socket.send(datagramPacket);
-            }
-        } catch (IOException ex) {
-            LOG.warning("[DISCOVERY] broadcast failed | reason=" + ex.getMessage());
+            handleDiscoveryPacket(packet, sender);
         }
-    }
 
-    private static InetAddress subnetBroadcastFor(InetAddress local) throws SocketException {
-        if (!(local instanceof Inet4Address)) {
-            return null;
-        }
-        NetworkInterface nic = NetworkInterface.getByInetAddress(local);
-        if (nic == null) {
-            return null;
-        }
-        for (InterfaceAddress ia : nic.getInterfaceAddresses()) {
-            if (ia.getAddress().equals(local)) {
-                InetAddress b = ia.getBroadcast();
-                if (b != null) {
-                    return b;
-                }
-            }
-        }
-        return null;
-    }
-
-    private void listenLoop() {
-        byte[] buffer = new byte[2048];
-        while (running) {
+        /**
+         * Десериализация ByteBuffer в DiscoveryPacket.
+         */
+        private DiscoveryPacket deserializePacket(ByteBuffer buffer) {
             try {
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                socket.receive(packet);
+                if (buffer.remaining() < 16) {
+                    return null; // Недостаточно данных
+                }
 
-                DiscoveryPacket.fromBytes(packet.getData(), packet.getLength()).ifPresent(parsed -> {
-                    try {
-                        InetAddress ip = InetAddress.getByName(parsed.ip());
-                        long nodeId = parsed.nodeId();
-                        InetAddress local = localIpSupplier.get();
-                        long now = System.currentTimeMillis();
+                long nodeId = buffer.getLong();
 
-                        if (nodeId == 0L && !ip.equals(local)) {
-                            return;
-                        }
+                byte[] ipBytes = new byte[4];
+                buffer.get(ipBytes);
+                InetAddress ipAddress = InetAddress.getByAddress(ipBytes);
 
-                        if (nodeId > 0L && nodeId == myId.get() && !ip.equals(local)) {
-                            if (compareInetAddress(local, ip) > 0) {
-                                resolveDuplicateNodeId(ip);
-                            }
-                        }
+                int tcpPort = buffer.getInt();
 
-                        InetAddress previousIpForId = liveNodes.get(nodeId);
-                        for (var it = liveNodes.entrySet().iterator(); it.hasNext(); ) {
-                            var e = it.next();
-                            if (e.getValue().equals(ip) && e.getKey() != nodeId) {
-                                it.remove();
-                                lastSeenMs.remove(e.getKey());
-                            }
-                        }
-                        liveNodes.put(nodeId, ip);
-                        lastSeenMs.put(nodeId, now);
-                        if (previousIpForId == null || !previousIpForId.equals(ip)) {
-                            LOG.info(logPrefix(myId.get()) + " [DISCOVERY] peer | nodeId=" + nodeId
-                                    + " | ip=" + ip.getHostAddress());
-                        }
-                    } catch (UnknownHostException ex) {
-                        LOG.warning(logPrefix(myId.get()) + " [DISCOVERY] invalid ip in packet | value="
-                                + parsed.ip());
+                return new DiscoveryPacket(nodeId, ipAddress, tcpPort);
+
+            } catch (Exception e) {
+                System.err.println("[UdpDiscovery] Deserialization error: " + e.getMessage());
+                return null;
+            }
+        }
+
+        private void handleDiscoveryPacket(DiscoveryPacket packet, SocketAddress sender) {
+            long remoteId = packet.nodeId();
+            InetAddress remoteIp = packet.ipAddress();
+            int remoteTcpPort = packet.tcpPort();
+
+            // Игнорируем свои пакеты
+            if (remoteId == ringState.myId()) {
+                return;
+            }
+
+            // Проверка конфликта nodeId
+            if (ringState.hasNode(remoteId)) {
+                NodeInfo existing = ringState.getNode(remoteId);
+                if (existing != null && !existing.ip().equals(remoteIp)) {
+                    // Конфликт! Разрешаем по правилу: меньший nodeId побеждает
+                    if (remoteId < ringState.myId()) {
+                        System.err.println("[UdpDiscovery] NodeId conflict detected! Regenerating...");
+                        regenerateNodeId();
+                        return;
+                    } else {
+                        // Игнорируем конфликтующий узел
+                        System.out.println("[UdpDiscovery] Ignoring conflicting node: " + remoteId);
+                        return;
                     }
-                });
-            } catch (SocketTimeoutException ignored) {
-                // keep polling
-            } catch (IOException ex) {
-                if (running) {
-                    LOG.warning(logPrefix(myId.get()) + " [DISCOVERY] listener error | reason=" + ex.getMessage());
                 }
             }
+
+            // Добавляем/обновляем узел
+            NodeInfo node = new NodeInfo(remoteId, remoteIp, remoteTcpPort, System.currentTimeMillis());
+            boolean added = ringState.addOrUpdateNode(node);
+
+            if (added) {
+                System.out.println("[UdpDiscovery] Discovered new node: " +
+                        remoteId + " at " + remoteIp.getHostAddress() + ":" + remoteTcpPort);
+            }
+        }
+
+        @Override
+        public void handleWrite(SelectionKey key) {
+        }
+
+        @Override
+        public void handleError(SelectionKey key, Exception e) {
+            System.err.println("[UdpDiscovery] Handler error: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
-    private void resolveDuplicateNodeId(InetAddress otherIp) {
-        long oldId = myId.get();
-        long newId = maxKnownNodeId() + 1L;
-        myId.set(newId);
+    /**
+     * Регенерация nodeId при конфликте.
+     */
+    private void regenerateNodeId() {
         try {
-            persistNodeId.accept(newId);
-        } catch (RuntimeException ex) {
-            LOG.warning(logPrefix(newId) + " [DISCOVERY] failed to persist new id | reason=" + ex.getMessage());
-        }
-        LOG.info(logPrefix(newId) + " [DISCOVERY] duplicate nodeId collision | otherIp=" + otherIp.getHostAddress()
-                + " | remapped " + oldId + " -> " + newId + " (larger local IP yields new id)");
-        BiConsumer<Long, Long> listener = onIdRemapped;
-        if (listener != null) {
-            try {
-                listener.accept(oldId, newId);
-            } catch (RuntimeException ex) {
-                LOG.warning(logPrefix(newId) + " [DISCOVERY] onIdRemapped failed | reason=" + ex.getMessage());
-            }
+            long oldId = ringState.myId();
+            ringState.regenerateMyId();
+            long newId = ringState.myId();
+            System.out.println("[UdpDiscovery] NodeId regenerated: " + oldId + " -> " + newId);
+        } catch (Exception e) {
+            System.err.println("[UdpDiscovery] Failed to regenerate nodeId: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
-    private long maxKnownNodeId() {
-        long max = myId.get();
-        for (Long id : liveNodes.keySet()) {
-            max = Math.max(max, id);
+    /**
+     * Получение локального IP адреса.
+     */
+    private InetAddress getLocalIpAddress() throws IOException {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.connect(InetAddress.getByName("8.8.8.8"), 80);
+            InetAddress localAddr = socket.getLocalAddress();
+            System.out.println("[UdpDiscovery] Local IP: " + localAddr.getHostAddress());
+            return localAddr;
+        } catch (Exception e) {
+            InetAddress fallback = InetAddress.getLocalHost();
+            System.out.println("[UdpDiscovery] Using fallback IP: " + fallback.getHostAddress());
+            return fallback;
         }
-        return max;
-    }
-
-    private static int compareInetAddress(InetAddress a, InetAddress b) {
-        byte[] aa = a.getAddress();
-        byte[] bb = b.getAddress();
-        if (aa.length != bb.length) {
-            return Integer.compare(aa.length, bb.length);
-        }
-        for (int i = 0; i < aa.length; i++) {
-            int va = aa[i] & 0xFF;
-            int vb = bb[i] & 0xFF;
-            if (va != vb) {
-                return Integer.compare(va, vb);
-            }
-        }
-        return 0;
-    }
-
-    private void cleanupDeadNodes() {
-        long now = System.currentTimeMillis();
-        long myId = this.myId.get();
-        for (Map.Entry<Long, Long> entry : lastSeenMs.entrySet()) {
-            long nodeId = entry.getKey();
-            if (nodeId == myId) {
-                continue;
-            }
-            if (now - entry.getValue() > nodeTimeoutMs) {
-                InetAddress removedIp = liveNodes.remove(nodeId);
-                lastSeenMs.remove(nodeId);
-                if (removedIp != null) {
-                    LOG.info(logPrefix(myId) + " [DISCOVERY] node timed out | nodeId=" + nodeId
-                            + " | lastSeenIp=" + removedIp.getHostAddress());
-                }
-            }
-        }
-    }
-
-    private String logPrefix(long myId) {
-        return "[myId=" + myId + "]";
     }
 
     @Override
     public void close() {
-        running = false;
-        scheduler.shutdownNow();
-        if (socket != null && !socket.isClosed()) {
-            socket.close();
+        if (!running) {
+            return;
         }
+
+        running = false;
+
+        System.out.println("[UdpDiscovery] Shutting down...");
+
+        scheduler.shutdownNow();
+
+        if (channel != null) {
+            try {
+                channel.close();
+            } catch (IOException ignored) {
+            }
+        }
+
+        System.out.println("[UdpDiscovery] Stopped");
     }
 }
