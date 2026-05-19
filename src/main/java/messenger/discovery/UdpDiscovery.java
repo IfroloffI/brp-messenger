@@ -183,11 +183,10 @@ public final class UdpDiscovery implements AutoCloseable {
                     if (remoteId < ringState.myId()) {
                         System.err.println("[UdpDiscovery] NodeId conflict detected! Regenerating...");
                         regenerateNodeId();
-                        return;
                     } else {
                         System.out.println("[UdpDiscovery] Ignoring conflicting node: " + remoteId);
-                        return;
                     }
+                    return;
                 }
             }
 

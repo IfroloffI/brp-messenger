@@ -1,626 +1,418 @@
 package messenger.transport;
 
-import messenger.nio.*;
+import messenger.crypto.CryptoService;
+import messenger.nio.ChannelHandler;
+import messenger.nio.NioEventLoop;
 import messenger.protocol.ChatMessage;
-import messenger.queue.OutboundMessage;
+import messenger.protocol.MessageType;
 import messenger.queue.OutboxStore;
-import messenger.ring.*;
+import messenger.ring.NodeInfo;
+import messenger.ring.RingState;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.channels.*;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.*;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.sql.SQLException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
- * Кольцевой транспорт на NIO.
+ * TCP транспорт для кольцевой топологии на базе NIO.
  * <p>
- * Поддерживает 2 соединения:
- * - Левое (входящее): принимает сообщения от левого соседа
- * - Правое (исходящее): отправляет сообщения правому соседу
- * <p>
- * Особенности:
- * - Все I/O операции неблокирующие через NioEventLoop
- * - Автоматическая дедупликация сообщений
- * - Persisted outbox для ненадёжных соединений
- * - Handshake protocol для обмена nodeId
+ * Управляет соединениями с левым и правым соседями.
+ * Пересылает транзитные сообщения по кольцу.
  */
-public final class RingTransport implements AutoCloseable {
+public final class RingTransport {
 
-    private static final int MAX_SEEN_MESSAGES = 10_000;
-    private static final int HANDSHAKE_TIMEOUT_MS = 5_000;
+    private static final int SERVER_PORT = 8080;
+    private static final int RECONNECT_DELAY_SEC = 5;
+    private static final int RETRY_DELAY_SEC = 10;
 
-    private final RingState ringState;
-    private final int tcpPort;
-    private final OutboxStore outboxStore;
-    private final Consumer<ChatMessage> onLocalDeliver;
+    private final long myNodeId;
     private final NioEventLoop eventLoop;
-
-    private final AtomicLong sequenceCounter = new AtomicLong(0L);
-
-    // Дедупликация сообщений (thread-safe для разных handlers)
-    private final Map<String, Boolean> seenMessageIds = Collections.synchronizedMap(
-            new LinkedHashMap<>() {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
-                    return size() > MAX_SEEN_MESSAGES;
-                }
-            }
-    );
+    private final RingState ringState;
+    private final CryptoService cryptoService;
+    private final OutboxStore outboxStore;
+    private final Consumer<ChatMessage> messageHandler;
 
     private ServerSocketChannel serverChannel;
-    private volatile LeftConnection leftConnection;
-    private volatile RightConnection rightConnection;
+    private ConnectionHandler leftConnection;
+    private ConnectionHandler rightConnection;
 
-    private volatile boolean running;
-    private final AtomicBoolean connectingRight = new AtomicBoolean(false);
+    private final Map<SocketChannel, ConnectionHandler> pendingConnections = new ConcurrentHashMap<>();
 
-    // Executor для асинхронных задач (connection, outbox drain)
-    private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "RingTransport-Worker");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private volatile boolean running = true;
 
-    public RingTransport(
-            RingState ringState,
-            int tcpPort,
-            OutboxStore outboxStore,
-            Consumer<ChatMessage> onLocalDeliver,
-            NioEventLoop eventLoop
-    ) {
-        this.ringState = ringState;
-        this.tcpPort = tcpPort;
-        this.outboxStore = outboxStore;
-        this.onLocalDeliver = onLocalDeliver;
+    public RingTransport(long myNodeId,
+                         NioEventLoop eventLoop,
+                         RingState ringState,
+                         CryptoService cryptoService,
+                         OutboxStore outboxStore,
+                         Consumer<ChatMessage> messageHandler) {
+        this.myNodeId = myNodeId;
         this.eventLoop = eventLoop;
+        this.ringState = ringState;
+        this.cryptoService = cryptoService;
+        this.outboxStore = outboxStore;
+        this.messageHandler = messageHandler;
     }
 
     /**
      * Запуск транспорта.
      */
     public void start() throws IOException {
-        running = true;
-
-        // Открываем server socket для входящих соединений
-        serverChannel = ServerSocketChannel.open();
-        serverChannel.bind(new InetSocketAddress(tcpPort));
-        serverChannel.configureBlocking(false);
-
-        // Регистрируем в event loop
-        eventLoop.register(serverChannel, SelectionKey.OP_ACCEPT, new ServerHandler());
-
-        System.out.println("[RingTransport] Started on port " + tcpPort + " (NIO mode)");
+        startServer();
+        startConnectionManager();
+        startRetryWorker();
+        System.out.println("[RingTransport] Started on port " + SERVER_PORT);
     }
 
     /**
-     * Обновление топологии кольца.
-     * Вызывается при изменении соседей.
+     * Остановка транспорта.
      */
-    public void refreshTopology() {
-        if (!running) {
-            return;
-        }
-
-        Optional<NodeInfo> right = ringState.rightNeighbor();
-
-        // Если нет правого соседа или мы одни в кольце
-        if (right.isEmpty() || right.get().nodeId() == ringState.myId()) {
-            closeRightConnection("no right neighbor or single node");
-            return;
-        }
-
-        NodeInfo rightInfo = right.get();
-        RightConnection current = rightConnection;
-
-        // Если уже подключены к нужному узлу
-        if (current != null && current.nodeId == rightInfo.nodeId() && current.isConnected()) {
-            return;
-        }
-
-        // Запускаем подключение к новому соседу
-        if (!connectingRight.compareAndSet(false, true)) {
-            return; // Уже подключаемся
-        }
-
-        executor.execute(() -> {
-            try {
-                connectRight(rightInfo);
-            } finally {
-                connectingRight.set(false);
-            }
-        });
-    }
-
-    /**
-     * Отправка сообщения в кольцо.
-     *
-     * @param targetId ID получателя или TARGET_BROADCAST
-     * @param payload  Текст сообщения
-     */
-    public void sendToRing(long targetId, String payload) {
-        long sequence = sequenceCounter.incrementAndGet();
-        long senderId = ringState.myId();
-        String messageId = ChatMessage.buildMessageId(senderId, sequence);
-
-        ChatMessage message = new ChatMessage(messageId, sequence, senderId, targetId, payload);
-
-        // Помечаем как уже виденное (чтобы не обработать свое сообщение повторно)
-        markSeen(message.messageId());
-
-        // Локальная доставка если адресовано нам или broadcast
-        if (targetId == senderId || targetId == ChatMessage.TARGET_BROADCAST) {
-            onLocalDeliver.accept(message);
-        }
-
-        // Отправка правому соседу
-        RightConnection conn = rightConnection;
-        if (conn == null || !conn.isConnected()) {
-            enqueueForRight(message);
-            return;
-        }
-
-        try {
-            conn.send(message);
-        } catch (Exception ex) {
-            System.err.println("[RingTransport] Send failed: " + ex.getMessage());
-            enqueueForRight(message);
-            closeRightConnection("send failed");
-        }
-    }
-
-    // ========================================================================
-    // SERVER HANDLER (принимает входящие соединения)
-    // ========================================================================
-
-    private class ServerHandler implements ChannelHandler {
-        @Override
-        public void handleAccept(SelectionKey key) throws IOException {
-            ServerSocketChannel server = (ServerSocketChannel) key.channel();
-            SocketChannel client = server.accept();
-
-            if (client != null) {
-                System.out.println("[RingTransport] Accepted connection from " + client.getRemoteAddress());
-
-                client.configureBlocking(false);
-                client.socket().setKeepAlive(true);
-                client.socket().setTcpNoDelay(true);
-
-                // Закрываем предыдущее левое соединение
-                if (leftConnection != null) {
-                    System.out.println("[RingTransport] Replacing left connection");
-                    leftConnection.close();
-                }
-
-                // Создаём новый handler
-                LeftConnection conn = new LeftConnection(client);
-                leftConnection = conn;
-
-                // Регистрируем в event loop
-                eventLoop.register(client, SelectionKey.OP_READ, conn);
-            }
-        }
-
-        @Override
-        public void handleConnect(SelectionKey key) {
-        }
-
-        @Override
-        public void handleRead(SelectionKey key) {
-        }
-
-        @Override
-        public void handleWrite(SelectionKey key) {
-        }
-
-        @Override
-        public void handleError(SelectionKey key, Exception e) {
-            System.err.println("[RingTransport] Server error: " + e.getMessage());
-        }
-    }
-
-    // ========================================================================
-    // LEFT CONNECTION (входящее соединение от левого соседа)
-    // ========================================================================
-
-    private class LeftConnection implements ChannelHandler {
-        private final SocketChannel channel;
-        private final ByteBuffer readBuffer;
-        private final MessageParser parser;
-
-        private long remoteId = -1L;
-        private boolean handshakeDone = false;
-        private long handshakeStartMs = System.currentTimeMillis();
-
-        LeftConnection(SocketChannel channel) {
-            this.channel = channel;
-            this.readBuffer = ByteBuffer.allocate(16384); // 16 KB read buffer
-            this.parser = new MessageParser();
-        }
-
-        @Override
-        public void handleAccept(SelectionKey key) {
-        }
-
-        @Override
-        public void handleConnect(SelectionKey key) {
-        }
-
-        @Override
-        public void handleRead(SelectionKey key) throws IOException {
-            if (!handshakeDone) {
-                handleHandshake();
-                return;
-            }
-
-            readBuffer.clear();
-            int bytesRead = channel.read(readBuffer);
-
-            if (bytesRead == -1) {
-                // Соединение закрыто удалённой стороной
-                System.out.println("[RingTransport] Left connection closed by peer");
-                close();
-                return;
-            }
-
-            if (bytesRead > 0) {
-                readBuffer.flip();
-                parser.feed(readBuffer);
-
-                // Обрабатываем все доступные сообщения
-                for (ChatMessage message : parser.drainMessages()) {
-                    handleMessage(message);
-                }
-            }
-        }
-
-        private void handleHandshake() throws IOException {
-            // Проверка таймаута
-            if (System.currentTimeMillis() - handshakeStartMs > HANDSHAKE_TIMEOUT_MS) {
-                System.err.println("[RingTransport] Left handshake timeout");
-                close();
-                return;
-            }
-
-            readBuffer.clear();
-            readBuffer.limit(8); // Ожидаем 8 байт (long)
-
-            int bytesRead = channel.read(readBuffer);
-            if (bytesRead == -1) {
-                close();
-                return;
-            }
-
-            if (readBuffer.position() == 8) {
-                readBuffer.flip();
-                remoteId = readBuffer.getLong();
-                handshakeDone = true;
-
-                System.out.println("[RingTransport] Left handshake complete: remoteId=" + remoteId);
-                readBuffer.clear(); // Готовы к приёму сообщений
-            }
-        }
-
-        private void handleMessage(ChatMessage message) {
-            // Дедупликация
-            if (isSeen(message.messageId())) {
-                return; // Уже обрабатывали это сообщение
-            }
-
-            markSeen(message.messageId());
-
-            boolean forMe = message.targetId() == ringState.myId();
-            boolean isBroadcast = message.isBroadcast();
-
-            // Локальная доставка
-            if (forMe || isBroadcast) {
-                onLocalDeliver.accept(message);
-            }
-
-            // Пересылка дальше (если не для нас)
-            if (!forMe) {
-                forwardRight(message);
-            }
-        }
-
-        @Override
-        public void handleWrite(SelectionKey key) {
-        }
-
-        @Override
-        public void handleError(SelectionKey key, Exception e) {
-            System.err.println("[RingTransport] Left connection error: " + e.getMessage());
-            close();
-        }
-
-        void close() {
-            try {
-                channel.close();
-            } catch (IOException ignored) {
-            }
-
-            if (leftConnection == this) {
-                leftConnection = null;
-            }
-        }
-    }
-
-    // ========================================================================
-    // RIGHT CONNECTION (исходящее соединение к правому соседу)
-    // ========================================================================
-
-    private class RightConnection implements ChannelHandler {
-        private final SocketChannel channel;
-        private final long nodeId;
-        private final ByteBuffer handshakeBuffer;
-        private final Queue<ByteBuffer> writeQueue;
-
-        private volatile boolean connected = false;
-        private boolean handshakeSent = false;
-
-        RightConnection(SocketChannel channel, long nodeId) {
-            this.channel = channel;
-            this.nodeId = nodeId;
-            this.writeQueue = new ConcurrentLinkedQueue<>();
-
-            // Подготовка handshake (наш nodeId)
-            this.handshakeBuffer = ByteBuffer.allocate(8);
-            handshakeBuffer.putLong(ringState.myId());
-            handshakeBuffer.flip();
-        }
-
-        boolean isConnected() {
-            return connected;
-        }
-
-        @Override
-        public void handleAccept(SelectionKey key) {
-        }
-
-        @Override
-        public void handleConnect(SelectionKey key) throws IOException {
-            if (channel.finishConnect()) {
-                System.out.println("[RingTransport] Right connected: nodeId=" + nodeId);
-
-                // Переключаемся на запись для отправки handshake
-                key.interestOps(SelectionKey.OP_WRITE);
-            }
-        }
-
-        @Override
-        public void handleRead(SelectionKey key) {
-        }
-
-        @Override
-        public void handleWrite(SelectionKey key) throws IOException {
-            // Сначала отправляем handshake
-            if (!handshakeSent) {
-                channel.write(handshakeBuffer);
-
-                if (!handshakeBuffer.hasRemaining()) {
-                    handshakeSent = true;
-                    connected = true;
-                    System.out.println("[RingTransport] Right handshake sent to " + nodeId);
-
-                    // Запускаем drain outbox в фоне
-                    executor.execute(() -> drainOutbox(nodeId));
-                }
-                return;
-            }
-
-            // Отправляем queued сообщения
-            while (true) {
-                ByteBuffer buffer = writeQueue.peek();
-                if (buffer == null) {
-                    // Нечего писать - убираем OP_WRITE
-                    key.interestOps(0);
-                    break;
-                }
-
-                channel.write(buffer);
-
-                if (!buffer.hasRemaining()) {
-                    writeQueue.poll(); // Сообщение отправлено полностью
-                } else {
-                    break; // Socket buffer заполнен, продолжим при следующем OP_WRITE
-                }
-            }
-        }
-
-        /**
-         * Отправка сообщения правому соседу.
-         * Thread-safe.
-         */
-        void send(ChatMessage message) {
-            ByteBuffer buffer = message.toByteBuffer();
-            writeQueue.offer(buffer);
-
-            // Включаем OP_WRITE через event loop
-            eventLoop.execute(() -> {
-                SelectionKey key = channel.keyFor(eventLoop.getSelector());
-                if (key != null && key.isValid()) {
-                    key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
-                }
-            });
-        }
-
-        @Override
-        public void handleError(SelectionKey key, Exception e) {
-            System.err.println("[RingTransport] Right connection error: " + e.getMessage());
-            close();
-        }
-
-        void close() {
-            try {
-                channel.close();
-            } catch (IOException ignored) {
-            }
-
-            connected = false;
-
-            if (rightConnection == this) {
-                rightConnection = null;
-            }
-        }
-    }
-
-    // ========================================================================
-    // HELPER METHODS
-    // ========================================================================
-
-    /**
-     * Подключение к правому соседу.
-     * Вызывается в worker потоке.
-     */
-    private void connectRight(NodeInfo rightInfo) {
-        String endpoint = rightInfo.ip().getHostAddress() + ":" + tcpPort;
-        System.out.println("[RingTransport] Connecting to right neighbor: " + endpoint);
-
-        try {
-            // Закрываем старое соединение
-            closeRightConnection("reconnecting to new neighbor");
-
-            SocketChannel channel = SocketChannel.open();
-            channel.configureBlocking(false);
-            channel.socket().setKeepAlive(true);
-            channel.socket().setTcpNoDelay(true);
-
-            // Начинаем подключение (non-blocking)
-            channel.connect(new InetSocketAddress(rightInfo.ip(), tcpPort));
-
-            RightConnection conn = new RightConnection(channel, rightInfo.nodeId());
-            rightConnection = conn;
-
-            // Регистрируем в event loop с OP_CONNECT
-            eventLoop.register(channel, SelectionKey.OP_CONNECT, conn);
-
-        } catch (IOException ex) {
-            System.err.println("[RingTransport] Failed to initiate connection: " + ex.getMessage());
-        }
-    }
-
-    /**
-     * Пересылка сообщения правому соседу.
-     */
-    private void forwardRight(ChatMessage message) {
-        RightConnection conn = rightConnection;
-        if (conn == null || !conn.isConnected()) {
-            enqueueForRight(message);
-            return;
-        }
-
-        try {
-            conn.send(message);
-        } catch (Exception ex) {
-            System.err.println("[RingTransport] Forward failed: " + ex.getMessage());
-            enqueueForRight(message);
-            closeRightConnection("forward failed");
-        }
-    }
-
-    /**
-     * Добавление сообщения в persisted outbox.
-     */
-    private void enqueueForRight(ChatMessage message) {
-        Optional<NodeInfo> right = ringState.rightNeighbor();
-        if (right.isEmpty()) {
-            return;
-        }
-
-        long neighborId = right.get().nodeId();
-        OutboundMessage outbound = new OutboundMessage(
-                message.messageId(),
-                message.sequenceNumber(),
-                message.senderId(),
-                message.targetId(),
-                message.payload(),
-                System.currentTimeMillis()
-        );
-
-        outboxStore.enqueue(neighborId, outbound);
-    }
-
-    /**
-     * Отправка накопленных сообщений из outbox.
-     * Вызывается в worker потоке после успешного подключения.
-     */
-    private void drainOutbox(long neighborId) {
-        int pending = outboxStore.size(neighborId);
-        if (pending == 0) {
-            return;
-        }
-
-        System.out.println("[RingTransport] Draining outbox: " + pending + " pending messages");
-
-        int drained = 0;
-        while (running) {
-            OutboundMessage message = outboxStore.peek(neighborId);
-            if (message == null) {
-                break; // Outbox пуст
-            }
-
-            RightConnection conn = rightConnection;
-            if (conn == null || !conn.isConnected()) {
-                System.out.println("[RingTransport] Drain paused (connection lost)");
-                break;
-            }
-
-            try {
-                conn.send(message.toChatMessage());
-                outboxStore.poll(neighborId); // Удаляем из outbox
-                drained++;
-            } catch (Exception ex) {
-                System.err.println("[RingTransport] Drain failed: " + ex.getMessage());
-                closeRightConnection("drain failed");
-                break;
-            }
-        }
-
-        if (drained > 0) {
-            System.out.println("[RingTransport] Drained " + drained + " messages from outbox");
-        }
-    }
-
-    private boolean isSeen(String messageId) {
-        return seenMessageIds.containsKey(messageId);
-    }
-
-    private void markSeen(String messageId) {
-        seenMessageIds.put(messageId, Boolean.TRUE);
-    }
-
-    private void closeRightConnection(String reason) {
-        RightConnection conn = rightConnection;
-        if (conn != null) {
-            System.out.println("[RingTransport] Closing right connection: " + reason);
-            conn.close();
-        }
-    }
-
-    @Override
-    public void close() {
+    public void stop() {
         running = false;
 
-        System.out.println("[RingTransport] Shutting down...");
+        try {
+            scheduler.shutdown();
+            if (!scheduler.awaitTermination(2, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
 
         try {
             if (serverChannel != null) {
                 serverChannel.close();
             }
-        } catch (IOException ignored) {
+        } catch (IOException e) {
+            System.err.println("[RingTransport] Error closing server: " + e.getMessage());
         }
-
-        if (leftConnection != null) {
-            leftConnection.close();
-        }
-
-        closeRightConnection("shutdown");
-
-        executor.shutdownNow();
 
         System.out.println("[RingTransport] Stopped");
+    }
+
+    /**
+     * Отправка сообщения.
+     */
+    public void sendMessage(ChatMessage message) {
+        eventLoop.execute(() -> {
+            try {
+                long messageId = outboxStore.addMessage(message);
+                boolean sent = trySendMessage(message);
+
+                if (sent) {
+                    outboxStore.removeMessage(messageId);
+                }
+            } catch (SQLException e) {
+                System.err.println("[RingTransport] Failed to save to outbox: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Попытка отправки сообщения правому соседу.
+     */
+    private boolean trySendMessage(ChatMessage message) {
+        if (rightConnection == null || !rightConnection.isOpen()) {
+            System.err.println("[RingTransport] No connection to right neighbor");
+            return false;
+        }
+
+        ChatMessage toSend = message.isEncrypted() ? message : encryptMessage(message);
+        return rightConnection.sendMessage(toSend);
+    }
+
+    /**
+     * Обработка входящего сообщения.
+     */
+    private void handleIncomingMessage(ChatMessage message) {
+        System.out.println("[RingTransport] Received: " + message);
+
+        if (message.getDestinationId() == myNodeId || message.isBroadcast()) {
+            ChatMessage decrypted = message.isEncrypted() ? decryptMessage(message) : message;
+            messageHandler.accept(decrypted);
+
+            if (message.isBroadcast()) {
+                forwardMessage(message);
+            }
+        } else {
+            forwardMessage(message);
+        }
+    }
+
+    /**
+     * Пересылка транзитного сообщения.
+     */
+    private void forwardMessage(ChatMessage message) {
+        if (rightConnection != null && rightConnection.isOpen()) {
+            System.out.println("[RingTransport] Forwarding message to right neighbor");
+            rightConnection.sendMessage(message);
+        } else {
+            System.err.println("[RingTransport] Cannot forward: no right connection");
+        }
+    }
+
+    /**
+     * Шифрование сообщения.
+     */
+    private ChatMessage encryptMessage(ChatMessage message) {
+        try {
+            if (message.getType() == MessageType.TEXT) {
+                ByteBuffer encrypted = cryptoService.encrypt(message.getContent());
+                byte[] encryptedBytes = new byte[encrypted.remaining()];
+                encrypted.get(encryptedBytes);
+
+                String encryptedContent = java.util.Base64.getEncoder().encodeToString(encryptedBytes);
+
+                return new ChatMessage.Builder()
+                        .senderId(message.getSenderId())
+                        .destinationId(message.getDestinationId())
+                        .type(MessageType.TEXT)
+                        .content(encryptedContent)
+                        .encrypted(true)
+                        .timestamp(message.getTimestamp())
+                        .build();
+            } else if (message.getType() == MessageType.FILE) {
+                ByteBuffer encrypted = cryptoService.encrypt(message.getFileData());
+                byte[] encryptedBytes = new byte[encrypted.remaining()];
+                encrypted.get(encryptedBytes);
+
+                return new ChatMessage.Builder()
+                        .senderId(message.getSenderId())
+                        .destinationId(message.getDestinationId())
+                        .type(MessageType.FILE)
+                        .fileName(message.getFileName())
+                        .fileData(encryptedBytes)
+                        .encrypted(true)
+                        .timestamp(message.getTimestamp())
+                        .build();
+            }
+        } catch (Exception e) {
+            System.err.println("[RingTransport] Encryption failed: " + e.getMessage());
+        }
+        return message;
+    }
+
+    /**
+     * Дешифрование сообщения.
+     */
+    private ChatMessage decryptMessage(ChatMessage message) {
+        try {
+            if (message.getType() == MessageType.TEXT) {
+                byte[] encryptedBytes = java.util.Base64.getDecoder().decode(message.getContent());
+                String decrypted = cryptoService.decryptToString(ByteBuffer.wrap(encryptedBytes));
+
+                return new ChatMessage.Builder()
+                        .senderId(message.getSenderId())
+                        .destinationId(message.getDestinationId())
+                        .type(MessageType.TEXT)
+                        .content(decrypted)
+                        .encrypted(false)
+                        .timestamp(message.getTimestamp())
+                        .build();
+            } else if (message.getType() == MessageType.FILE) {
+                byte[] decrypted = cryptoService.decryptToBytes(ByteBuffer.wrap(message.getFileData()));
+
+                return new ChatMessage.Builder()
+                        .senderId(message.getSenderId())
+                        .destinationId(message.getDestinationId())
+                        .type(MessageType.FILE)
+                        .fileName(message.getFileName())
+                        .fileData(decrypted)
+                        .encrypted(false)
+                        .timestamp(message.getTimestamp())
+                        .build();
+            }
+        } catch (Exception e) {
+            System.err.println("[RingTransport] Decryption failed: " + e.getMessage());
+        }
+        return message;
+    }
+
+    /**
+     * Запуск сервера для входящих соединений.
+     */
+    private void startServer() throws IOException {
+        serverChannel = ServerSocketChannel.open();
+        serverChannel.configureBlocking(false);
+        serverChannel.bind(new InetSocketAddress(SERVER_PORT));
+
+        eventLoop.register(serverChannel, SelectionKey.OP_ACCEPT, new ChannelHandler() {
+            @Override
+            public void handleAccept(SelectionKey key) throws IOException {
+                SocketChannel clientChannel = serverChannel.accept();
+                if (clientChannel != null) {
+                    clientChannel.configureBlocking(false);
+
+                    String remoteAddr = clientChannel.getRemoteAddress().toString();
+                    System.out.println("[RingTransport] Accepted connection from: " + remoteAddr);
+
+                    ConnectionHandler handler = new ConnectionHandler(
+                            clientChannel,
+                            RingTransport.this::handleIncomingMessage,
+                            remoteAddr
+                    );
+
+                    pendingConnections.put(clientChannel, handler);
+                    eventLoop.register(clientChannel, SelectionKey.OP_READ, handler);
+                }
+            }
+
+            @Override
+            public void handleConnect(SelectionKey key) throws IOException {
+            }
+
+            @Override
+            public void handleRead(SelectionKey key) throws IOException {
+            }
+
+            @Override
+            public void handleWrite(SelectionKey key) throws IOException {
+            }
+
+            @Override
+            public void handleError(SelectionKey key, Exception e) {
+                System.err.println("[RingTransport] Server error: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Запуск менеджера соединений с соседями (через ScheduledExecutor).
+     */
+    private void startConnectionManager() {
+        scheduler.scheduleWithFixedDelay(() -> {
+            if (!running) return;
+
+            try {
+                // Получаем правого соседа из RingState
+                ringState.rightNeighbor().ifPresent(right -> {
+                    if (rightConnection == null || !rightConnection.isOpen()) {
+                        connectToNeighbor(right, true);
+                    }
+                });
+
+            } catch (Exception e) {
+                System.err.println("[RingTransport] Connection manager error: " + e.getMessage());
+            }
+        }, RECONNECT_DELAY_SEC, RECONNECT_DELAY_SEC, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Подключение к соседу.
+     */
+    private void connectToNeighbor(NodeInfo neighbor, boolean isRight) {
+        eventLoop.execute(() -> {
+            try {
+                SocketChannel channel = SocketChannel.open();
+                channel.configureBlocking(false);
+
+                InetSocketAddress address = new InetSocketAddress(
+                        neighbor.ip().getHostAddress(),
+                        neighbor.tcpPort()
+                );
+
+                channel.connect(address);
+
+                String side = isRight ? "right" : "left";
+                System.out.println("[RingTransport] Connecting to " + side + " neighbor: " + address);
+
+                ConnectionHandler handler = new ConnectionHandler(
+                        channel,
+                        this::handleIncomingMessage,
+                        side + "-" + neighbor.nodeId()
+                );
+
+                if (isRight) {
+                    rightConnection = handler;
+                } else {
+                    leftConnection = handler;
+                }
+
+                eventLoop.register(channel, SelectionKey.OP_CONNECT, new ChannelHandler() {
+                    @Override
+                    public void handleAccept(SelectionKey key) throws IOException {
+                    }
+
+                    @Override
+                    public void handleConnect(SelectionKey key) throws IOException {
+                        if (channel.finishConnect()) {
+                            System.out.println("[RingTransport] Connected to " + side + " neighbor");
+                            eventLoop.register(channel, SelectionKey.OP_READ, handler);
+                        }
+                    }
+
+                    @Override
+                    public void handleRead(SelectionKey key) throws IOException {
+                    }
+
+                    @Override
+                    public void handleWrite(SelectionKey key) throws IOException {
+                    }
+
+                    @Override
+                    public void handleError(SelectionKey key, Exception e) {
+                        System.err.println("[RingTransport] Connection error to " + side + ": " + e.getMessage());
+                        if (isRight) {
+                            rightConnection = null;
+                        } else {
+                            leftConnection = null;
+                        }
+                    }
+                });
+
+            } catch (IOException e) {
+                System.err.println("[RingTransport] Connection failed: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Запуск worker для retry неотправленных сообщений (через ScheduledExecutor).
+     */
+    private void startRetryWorker() {
+        scheduler.scheduleWithFixedDelay(() -> {
+            if (!running) return;
+
+            try {
+                var pending = outboxStore.getPendingMessages();
+
+                for (var outbound : pending) {
+                    boolean sent = trySendMessage(outbound.message());
+
+                    if (sent) {
+                        outboxStore.removeMessage(outbound.id());
+                    } else {
+                        outboxStore.incrementRetry(outbound.id());
+                    }
+                }
+
+                outboxStore.cleanupOldMessages();
+
+            } catch (SQLException e) {
+                System.err.println("[RingTransport] Retry worker error: " + e.getMessage());
+            }
+        }, RETRY_DELAY_SEC, RETRY_DELAY_SEC, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Получение состояния соединений.
+     */
+    public String getConnectionStatus() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Left: ").append(leftConnection != null && leftConnection.isOpen() ? "✓" : "✗").append("\n");
+        sb.append("Right: ").append(rightConnection != null && rightConnection.isOpen() ? "✓" : "✗");
+        return sb.toString();
     }
 }

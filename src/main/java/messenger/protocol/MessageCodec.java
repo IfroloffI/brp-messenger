@@ -1,9 +1,8 @@
 package messenger.protocol;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 
-/**
+/*
  * Кодек для сериализации/десериализации ChatMessage в/из ByteBuffer.
  * <p>
  * Формат сообщения (binary):
@@ -20,179 +19,112 @@ import java.nio.charset.StandardCharsets;
  * └─────────────────┴──────────────────────────────────────────────┘
  * Всего: 28 + N + M bytes
  */
+
+/**
+ * Кодек для сериализации/десериализации сообщений.
+ * <p>
+ * Обрабатывает length-prefixed протокол для stream parsing.
+ */
 public final class MessageCodec {
 
-    private static final int MAX_MESSAGE_ID_LENGTH = 1024;
-    private static final int MAX_PAYLOAD_LENGTH = 1024 * 1024; // 1 MB
+    private static final int HEADER_SIZE = 4; // 4 байта для длины сообщения
 
     /**
-     * Сериализация ChatMessage в ByteBuffer.
+     * Кодирование сообщения с length prefix.
+     * <p>
+     * Формат: [length:4 bytes][message data]
      *
-     * @param message Сообщение для сериализации
-     * @return ByteBuffer готовый для записи (position=0, limit=size)
+     * @param message Сообщение для кодирования
+     * @return ByteBuffer с закодированным сообщением
      */
     public static ByteBuffer encode(ChatMessage message) {
-        byte[] messageIdBytes = message.messageId().getBytes(StandardCharsets.UTF_8);
-        byte[] payloadBytes = message.payload().getBytes(StandardCharsets.UTF_8);
+        ByteBuffer messageBuffer = message.toByteBuffer();
+        int messageLength = messageBuffer.remaining();
 
-        int totalSize = 4 + messageIdBytes.length   // messageId length + data
-                + 8                           // sequenceNumber
-                + 8                           // senderId
-                + 8                           // targetId
-                + 4 + payloadBytes.length;    // payload length + data
+        ByteBuffer result = ByteBuffer.allocate(HEADER_SIZE + messageLength);
+        result.putInt(messageLength);
+        result.put(messageBuffer);
+        result.flip();
 
-        ByteBuffer buffer = ByteBuffer.allocate(totalSize);
-
-        // messageId
-        buffer.putInt(messageIdBytes.length);
-        buffer.put(messageIdBytes);
-
-        // sequenceNumber
-        buffer.putLong(message.sequenceNumber());
-
-        // senderId
-        buffer.putLong(message.senderId());
-
-        // targetId
-        buffer.putLong(message.targetId());
-
-        // payload
-        buffer.putInt(payloadBytes.length);
-        buffer.put(payloadBytes);
-
-        buffer.flip();
-        return buffer;
+        return result;
     }
 
     /**
-     * Десериализация ChatMessage из ByteBuffer.
+     * Декодирование сообщения из буфера.
      * <p>
-     * ВАЖНО: Метод не изменяет позицию buffer если недостаточно данных.
-     * Позиция buffer перемещается только при успешном парсинге.
+     * Буфер должен быть в режиме чтения (после flip).
+     * После успешного декодирования позиция буфера сдвигается.
      *
-     * @param buffer ByteBuffer с позицией в начале сообщения
-     * @return ChatMessage или null если недостаточно данных или ошибка формата
+     * @param buffer Буфер с данными
+     * @return Декодированное сообщение или null если данных недостаточно
      */
     public static ChatMessage decode(ByteBuffer buffer) {
-        // Сохраняем позицию для возможности отката
-        int startPosition = buffer.position();
+        if (!hasCompleteMessage(buffer)) {
+            return null;
+        }
+
+        // Сохраняем позицию на случай неудачи
+        int position = buffer.position();
 
         try {
-            // Проверяем минимальные данные для чтения длины messageId
-            if (buffer.remaining() < 4) {
-                buffer.position(startPosition);
+            int messageLength = buffer.getInt();
+
+            if (buffer.remaining() < messageLength) {
+                // Недостаточно данных, откатываем позицию
+                buffer.position(position);
                 return null;
             }
 
-            // Читаем длину messageId
-            int messageIdLength = buffer.getInt();
+            // Читаем сообщение
+            int limit = buffer.limit();
+            buffer.limit(buffer.position() + messageLength);
 
-            // Валидация длины messageId
-            if (messageIdLength < 0 || messageIdLength > MAX_MESSAGE_ID_LENGTH) {
-                System.err.println("[Codec] Invalid messageId length: " + messageIdLength);
-                buffer.position(startPosition);
-                return null;
+            ChatMessage message = ChatMessage.fromByteBuffer(buffer);
+
+            buffer.limit(limit);
+
+            if (message == null) {
+                // Ошибка парсинга, откатываем
+                buffer.position(position);
             }
 
-            // Проверяем хватает ли данных для header
-            int requiredForHeader = messageIdLength + 8 + 8 + 8 + 4;
-            if (buffer.remaining() < requiredForHeader) {
-                buffer.position(startPosition);
-                return null;
-            }
-
-            // Читаем messageId
-            byte[] messageIdBytes = new byte[messageIdLength];
-            buffer.get(messageIdBytes);
-            String messageId = new String(messageIdBytes, StandardCharsets.UTF_8);
-
-            // Читаем числовые поля
-            long sequenceNumber = buffer.getLong();
-            long senderId = buffer.getLong();
-            long targetId = buffer.getLong();
-
-            // Читаем длину payload
-            int payloadLength = buffer.getInt();
-
-            // Валидация длины payload
-            if (payloadLength < 0 || payloadLength > MAX_PAYLOAD_LENGTH) {
-                System.err.println("[Codec] Invalid payload length: " + payloadLength);
-                buffer.position(startPosition);
-                return null;
-            }
-
-            // Проверяем хватает ли данных для payload
-            if (buffer.remaining() < payloadLength) {
-                buffer.position(startPosition);
-                return null;
-            }
-
-            // Читаем payload
-            byte[] payloadBytes = new byte[payloadLength];
-            buffer.get(payloadBytes);
-            String payload = new String(payloadBytes, StandardCharsets.UTF_8);
-
-            // Успешно распарсили - позиция уже передвинута
-            return new ChatMessage(messageId, sequenceNumber, senderId, targetId, payload);
-
+            return message;
         } catch (Exception e) {
-            System.err.println("[Codec] Decode error: " + e.getMessage());
-            buffer.position(startPosition);
+            // Ошибка при парсинге, откатываем позицию
+            buffer.position(position);
+            System.err.println("[MessageCodec] Decode error: " + e.getMessage());
             return null;
         }
     }
 
     /**
-     * Вычисление полного размера сообщения для предварительной проверки.
+     * Проверка наличия полного сообщения в буфере.
      *
-     * @param buffer ByteBuffer для анализа (позиция не изменяется)
-     * @return Размер сообщения в байтах или -1 если недостаточно данных
-     */
-    public static int calculateMessageSize(ByteBuffer buffer) {
-        if (buffer.remaining() < 4) {
-            return -1;
-        }
-
-        int startPosition = buffer.position();
-
-        try {
-            int messageIdLength = buffer.getInt();
-
-            if (messageIdLength < 0 || messageIdLength > MAX_MESSAGE_ID_LENGTH) {
-                return -1;
-            }
-
-            int headerSize = 4 + messageIdLength + 8 + 8 + 8 + 4;
-
-            if (buffer.remaining() < headerSize - 4) {
-                return -1;
-            }
-
-            // Пропускаем до payload length
-            buffer.position(startPosition + 4 + messageIdLength + 8 + 8 + 8);
-            int payloadLength = buffer.getInt();
-
-            if (payloadLength < 0 || payloadLength > MAX_PAYLOAD_LENGTH) {
-                return -1;
-            }
-
-            return headerSize + payloadLength;
-
-        } catch (Exception e) {
-            return -1;
-        } finally {
-            buffer.position(startPosition);
-        }
-    }
-
-    /**
-     * Проверка имеет ли buffer полное сообщение.
-     *
-     * @param buffer ByteBuffer для проверки
+     * @param buffer Буфер для проверки (в режиме чтения)
      * @return true если есть полное сообщение
      */
     public static boolean hasCompleteMessage(ByteBuffer buffer) {
-        int size = calculateMessageSize(buffer);
-        return size > 0 && buffer.remaining() >= size;
+        if (buffer.remaining() < HEADER_SIZE) {
+            return false;
+        }
+
+        // Читаем длину без изменения позиции
+        int position = buffer.position();
+        int messageLength = buffer.getInt(position);
+
+        // Проверяем валидность длины
+        if (messageLength < 0 || messageLength > 10 * 1024 * 1024) { // max 10MB
+            System.err.println("[MessageCodec] Invalid message length: " + messageLength);
+            return false;
+        }
+
+        return buffer.remaining() >= HEADER_SIZE + messageLength;
+    }
+
+    /**
+     * Получение размера заголовка.
+     */
+    public static int getHeaderSize() {
+        return HEADER_SIZE;
     }
 }
