@@ -1,19 +1,9 @@
 package messenger.app;
 
-import messenger.crypto.CryptoService;
-import messenger.crypto.KeyPairManager;
-import messenger.discovery.DiscoveryService;
-import messenger.protocol.ChatMessage;
-import messenger.protocol.MessageType;
-import messenger.ring.NodeInfo;
-import messenger.ring.RingState;
-import messenger.storage.DeliveryTracker;
-import messenger.storage.OutboxStore;
-import messenger.transport.RingTransport;
-
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,6 +14,18 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import messenger.crypto.CryptoService;
+import messenger.crypto.KeyPairManager;
+import messenger.crypto.KeyStorage;
+import messenger.discovery.DiscoveryService;
+import messenger.protocol.ChatMessage;
+import messenger.protocol.MessageType;
+import messenger.ring.NodeInfo;
+import messenger.ring.RingState;
+import messenger.storage.DeliveryTracker;
+import messenger.storage.OutboxStore;
+import messenger.transport.RingTransport;
 
 /**
  * Главный класс приложения P2P Messenger.
@@ -39,6 +41,7 @@ public final class Main {
 
     private static final int UDP_DISCOVERY_PORT = 9876;
     private static final String DOWNLOADS_DIR = System.getProperty("user.home") + "/.messenger/downloads";
+        private static final String KEYS_DIR = System.getProperty("user.home") + "/.messenger/keys";
 
     private static volatile boolean running = true;
 
@@ -66,13 +69,14 @@ public final class Main {
             System.out.println("[" + formatTime() + "] RingState initialized");
 
             // 2. Инициализация криптографии
-            CryptoService cryptoService = new CryptoService();
+            KeyStorage keyStorage = new KeyStorage(Paths.get(KEYS_DIR));
+            CryptoService cryptoService = new CryptoService(keyStorage);
             KeyPairManager keyPairManager = new KeyPairManager();
 
             // Регистрируем свои ключи в RingState
             ringState.updateNode(new NodeInfo(
                     myNodeId,
-                    "localhost",
+                    InetAddress.getByName("localhost"),
                     9877,
                     System.currentTimeMillis(),
                     cryptoService.getMyEncryptionPublicKey(),
@@ -126,8 +130,7 @@ public final class Main {
                     myNodeId,
                     UDP_DISCOVERY_PORT,
                     ringState,
-                    cryptoService.getMyEncryptionPublicKey(),
-                    cryptoService.getMySigningPublicKey()
+                    keyStorage
             );
             discovery.start();
             System.out.println("[" + formatTime() + "] DiscoveryService started on UDP port " + UDP_DISCOVERY_PORT);

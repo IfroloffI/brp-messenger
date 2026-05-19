@@ -1,5 +1,23 @@
 package messenger.transport;
 
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
+import java.security.PublicKey;
+import java.util.ArrayDeque;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
 import messenger.crypto.CryptoService;
 import messenger.crypto.DecryptedMessage;
 import messenger.crypto.EncryptedMessage;
@@ -10,18 +28,6 @@ import messenger.protocol.MessageType;
 import messenger.protocol.SignatureStatus;
 import messenger.ring.NodeInfo;
 import messenger.ring.RingState;
-
-import java.io.*;
-import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.channels.*;
-import java.nio.charset.StandardCharsets;
-import java.security.PublicKey;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
  * Транспорт для кольцевой топологии с E2E шифрованием и цифровой подписью
@@ -342,7 +348,7 @@ public class RingTransport implements AutoCloseable {
     /**
      * Внутренняя отправка сообщения в кольцо
      */
-    private void sendMessage(ChatMessage message) throws IOException {
+    public void sendMessage(ChatMessage message) throws IOException {
         Long rightNeighbor = ringState.getRightNeighbor();
 
         if (rightNeighbor == null) {

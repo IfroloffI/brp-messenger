@@ -1,19 +1,22 @@
 package messenger.discovery;
 
-import messenger.crypto.KeyPairManager;
-import messenger.crypto.KeyStorage;
-import messenger.protocol.DiscoveryPacket;
-import messenger.ring.NodeInfo;
-import messenger.ring.RingState;
-
 import java.io.IOException;
-import java.net.*;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.security.PublicKey;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import messenger.crypto.KeyPairManager;
+import messenger.crypto.KeyStorage;
+import messenger.protocol.DiscoveryPacket;
+import messenger.ring.NodeInfo;
+import messenger.ring.RingState;
 
 /**
  * Сервис обнаружения узлов через UDP broadcast с обменом публичными ключами
@@ -209,5 +212,12 @@ public class DiscoveryService implements AutoCloseable {
         }
 
         logger.info("Discovery service stopped");
+    }
+
+    /**
+     * Совместимый alias для кода, который ожидает stop().
+     */
+    public void stop() {
+        close();
     }
 }
