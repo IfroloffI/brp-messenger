@@ -1,0 +1,101 @@
+.root {
+    -fx-font-family: "Segoe UI", "Arial", sans-serif;
+    -fx-base: #f5f6f7;
+}
+
+.app-root {
+    -fx-background-color:
+        linear-gradient(to bottom right, #f7f9fb 0%, #eef3f7 100%);
+}
+
+.section-title {
+    -fx-font-size: 15px;
+    -fx-font-weight: 700;
+    -fx-text-fill: #213142;
+}
+
+.network-panel,
+.chat-panel,
+.file-panel {
+    -fx-background-color: #ffffff;
+    -fx-background-radius: 10px;
+    -fx-border-color: #d8e2ea;
+    -fx-border-radius: 10px;
+}
+
+.network-panel {
+    -fx-effect: dropshadow(gaussian, rgba(22, 37, 55, 0.08), 10, 0.2, 0, 2);
+}
+
+.chat-panel {
+    -fx-effect: dropshadow(gaussian, rgba(22, 37, 55, 0.06), 8, 0.2, 0, 2);
+}
+
+.file-panel {
+    -fx-effect: dropshadow(gaussian, rgba(22, 37, 55, 0.05), 8, 0.2, 0, 2);
+}
+
+.list-view,
+.text-area,
+.text-field {
+    -fx-background-radius: 8px;
+    -fx-border-radius: 8px;
+    -fx-border-color: #d3dde6;
+    -fx-focus-color: #1b9aaa;
+    -fx-faint-focus-color: rgba(27, 154, 170, 0.15);
+}
+
+.button {
+    -fx-background-radius: 8px;
+    -fx-cursor: hand;
+    -fx-font-weight: 600;
+}
+
+.accent-button {
+    -fx-background-color: #1b9aaa;
+    -fx-text-fill: white;
+}
+
+.accent-button:hover {
+    -fx-background-color: #148291;
+}
+
+.ghost-button {
+    -fx-background-color: #e6edf3;
+    -fx-text-fill: #22313f;
+}
+
+.ghost-button:hover {
+    -fx-background-color: #d9e4ed;
+}
+
+.danger-button {
+    -fx-background-color: #e0574f;
+    -fx-text-fill: white;
+}
+
+.danger-button:hover {
+    -fx-background-color: #c94a42;
+}
+
+.meta-label {
+    -fx-text-fill: #465b6c;
+    -fx-font-size: 12px;
+}
+
+.field-label {
+    -fx-text-fill: #2f4354;
+    -fx-font-size: 12px;
+    -fx-font-weight: 600;
+}
+
+.status-bar {
+    -fx-background-color: #f0f5f9;
+    -fx-border-color: #d4dfe8 transparent transparent transparent;
+    -fx-border-width: 1px 0 0 0;
+}
+
+.status-title {
+    -fx-font-weight: 700;
+    -fx-text-fill: #2a3e52;
+}

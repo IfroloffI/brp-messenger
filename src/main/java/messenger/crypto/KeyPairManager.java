@@ -1,8 +1,15 @@
 package messenger.crypto;
 
-import java.security.*;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.SecureRandom;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
 
 /**
  * Генерация и управление RSA ключами
@@ -29,6 +36,13 @@ public class KeyPairManager {
      */
     public byte[] publicKeyToBytes(PublicKey key) {
         return key.getEncoded(); // X.509 format
+    }
+
+    /**
+     * Конвертирует PublicKey в Base64 строку.
+     */
+    public String publicKeyToBase64(PublicKey key) {
+        return Base64.getEncoder().encodeToString(publicKeyToBytes(key));
     }
 
     /**
