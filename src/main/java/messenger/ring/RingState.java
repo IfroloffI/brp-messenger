@@ -1,197 +1,212 @@
 package messenger.ring;
 
+import java.security.PublicKey;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 /**
- * Состояние кольцевой топологии.
- * <p>
- * Thread-safe: все операции синхронизированы.
+ * Управление состоянием логического кольца с публичными ключами узлов
  */
-public final class RingState {
+public class RingState {
+    private static final Logger logger = Logger.getLogger(RingState.class.getName());
+    private static final long NODE_TIMEOUT_MS = 10_000;
 
-    private final AtomicLong myNodeId;
+    private final long myNodeId;
     private final Map<Long, NodeInfo> nodes;
+    private final ReadWriteLock lock;
 
-    public RingState() {
-        this.myNodeId = new AtomicLong(generateNodeId());
+    private volatile Long leftNeighbor;
+    private volatile Long rightNeighbor;
+
+    public RingState(long myNodeId) {
+        this.myNodeId = myNodeId;
         this.nodes = new ConcurrentHashMap<>();
+        this.lock = new ReentrantReadWriteLock();
     }
 
     /**
-     * Получить ID текущего узла.
+     * Обновляет информацию об узле (или добавляет новый)
      */
-    public long myId() {
-        return myNodeId.get();
-    }
+    public void updateNode(NodeInfo nodeInfo) {
+        lock.writeLock().lock();
+        try {
+            NodeInfo existing = nodes.get(nodeInfo.nodeId());
 
-    /**
-     * Регенерация nodeId (при конфликте).
-     */
-    public void regenerateMyId() {
-        long newId = generateNodeId();
-        myNodeId.set(newId);
-        System.out.println("[RingState] NodeId regenerated: " + newId);
-    }
+            if (existing != null) {
+                // Обновляем timestamp и ключи (если они есть)
+                NodeInfo updated = existing.withUpdatedTimestamp(nodeInfo.lastSeen());
 
-    /**
-     * Добавление или обновление узла.
-     *
-     * @param node Информация об узле
-     * @return true если узел новый, false если обновлён
-     */
-    public boolean addOrUpdateNode(NodeInfo node) {
-        boolean isNew = !nodes.containsKey(node.nodeId());
-        nodes.put(node.nodeId(), node);
+                // Если пришли новые ключи, обновляем их
+                if (nodeInfo.hasKeys() && !existing.hasKeys()) {
+                    updated = updated.withKeys(
+                            nodeInfo.encryptionPublicKey(),
+                            nodeInfo.signingPublicKey()
+                    );
+                    logger.info("Updated keys for node " + nodeInfo.nodeId());
+                }
 
-        if (isNew) {
-            System.out.println("[RingState] Added node: " + node);
-            rebuildRing();
-        }
-
-        return isNew;
-    }
-
-    /**
-     * Удаление устаревших узлов.
-     *
-     * @param timeoutMs Таймаут в миллисекундах
-     * @return Количество удалённых узлов
-     */
-    public int removeOldNodes(long timeoutMs) {
-        long now = System.currentTimeMillis();
-        int removed = 0;
-
-        Iterator<Map.Entry<Long, NodeInfo>> it = nodes.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<Long, NodeInfo> entry = it.next();
-            long lastSeen = entry.getValue().lastSeenMs();
-
-            if (now - lastSeen > timeoutMs) {
-                System.out.println("[RingState] Removing timed-out node: " + entry.getKey() +
-                        " (last seen " + (now - lastSeen) + "ms ago)");
-                it.remove();
-                removed++;
+                nodes.put(nodeInfo.nodeId(), updated);
+            } else {
+                // Новый узел
+                nodes.put(nodeInfo.nodeId(), nodeInfo);
+                logger.info("New node discovered: " + nodeInfo);
+                recalculateNeighbors();
             }
-        }
 
-        if (removed > 0) {
-            rebuildRing();
+        } finally {
+            lock.writeLock().unlock();
         }
-
-        return removed;
     }
 
     /**
-     * Проверка существования узла.
+     * Удаляет узел из кольца
      */
-    public boolean hasNode(long nodeId) {
-        return nodes.containsKey(nodeId);
+    public void removeNode(long nodeId) {
+        lock.writeLock().lock();
+        try {
+            NodeInfo removed = nodes.remove(nodeId);
+            if (removed != null) {
+                logger.info("Node removed: " + nodeId);
+                recalculateNeighbors();
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     /**
-     * Получение информации об узле.
+     * Удаляет узлы с истёкшим таймаутом
      */
+    public void removeExpiredNodes() {
+        lock.writeLock().lock();
+        try {
+            long now = System.currentTimeMillis();
+            List<Long> expired = nodes.values().stream()
+                    .filter(n -> n.isExpired(now, NODE_TIMEOUT_MS))
+                    .map(NodeInfo::nodeId)
+                    .collect(Collectors.toList());
+
+            if (!expired.isEmpty()) {
+                expired.forEach(nodes::remove);
+                logger.info("Removed expired nodes: " + expired);
+                recalculateNeighbors();
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Пересчитывает соседей в логическом кольце
+     */
+    private void recalculateNeighbors() {
+        List<Long> sortedIds = new ArrayList<>(nodes.keySet());
+        sortedIds.add(myNodeId);
+        Collections.sort(sortedIds);
+
+        int myIndex = sortedIds.indexOf(myNodeId);
+        int size = sortedIds.size();
+
+        if (size == 1) {
+            leftNeighbor = null;
+            rightNeighbor = null;
+        } else {
+            int leftIndex = (myIndex - 1 + size) % size;
+            int rightIndex = (myIndex + 1) % size;
+
+            leftNeighbor = sortedIds.get(leftIndex);
+            rightNeighbor = sortedIds.get(rightIndex);
+
+            // Не указываем на самих себя
+            if (leftNeighbor.equals(myNodeId)) leftNeighbor = null;
+            if (rightNeighbor.equals(myNodeId)) rightNeighbor = null;
+        }
+
+        logger.info(String.format("Ring updated: left=%s, me=%d, right=%s",
+                leftNeighbor, myNodeId, rightNeighbor));
+    }
+
+    /**
+     * ДОБАВЛЕНО: Получить публичные ключи узла
+     */
+    public NodeKeys getNodeKeys(long nodeId) {
+        lock.readLock().lock();
+        try {
+            NodeInfo node = nodes.get(nodeId);
+            if (node != null && node.hasKeys()) {
+                return new NodeKeys(
+                        node.encryptionPublicKey(),
+                        node.signingPublicKey()
+                );
+            }
+            return null;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * ДОБАВЛЕНО: Получить публичный ключ шифрования узла
+     */
+    public PublicKey getEncryptionPublicKey(long nodeId) {
+        lock.readLock().lock();
+        try {
+            NodeInfo node = nodes.get(nodeId);
+            return node != null ? node.encryptionPublicKey() : null;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * ДОБАВЛЕНО: Получить публичный ключ подписи узла
+     */
+    public PublicKey getSigningPublicKey(long nodeId) {
+        lock.readLock().lock();
+        try {
+            NodeInfo node = nodes.get(nodeId);
+            return node != null ? node.signingPublicKey() : null;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    // Getters
+
     public NodeInfo getNode(long nodeId) {
         return nodes.get(nodeId);
     }
 
-    /**
-     * Получение всех узлов.
-     */
-    public List<NodeInfo> getAllNodes() {
+    public Collection<NodeInfo> getAllNodes() {
         return new ArrayList<>(nodes.values());
     }
 
-    /**
-     * Получение правого соседа (следующий по кольцу).
-     */
-    public Optional<NodeInfo> rightNeighbor() {
-        List<Long> sortedIds = getSortedNodeIds();
-
-        if (sortedIds.isEmpty()) {
-            return Optional.empty();
-        }
-
-        long myId = myId();
-        int myIndex = sortedIds.indexOf(myId);
-
-        // Если нас нет в списке или мы одни
-        if (myIndex == -1 || sortedIds.size() == 1) {
-            return Optional.empty();
-        }
-
-        // Следующий по кольцу (с wraparound)
-        int rightIndex = (myIndex + 1) % sortedIds.size();
-        long rightId = sortedIds.get(rightIndex);
-
-        return Optional.ofNullable(nodes.get(rightId));
+    public Long getLeftNeighbor() {
+        return leftNeighbor;
     }
 
-    /**
-     * Получение левого соседа (предыдущий по кольцу).
-     */
-    public Optional<NodeInfo> leftNeighbor() {
-        List<Long> sortedIds = getSortedNodeIds();
-
-        if (sortedIds.isEmpty()) {
-            return Optional.empty();
-        }
-
-        long myId = myId();
-        int myIndex = sortedIds.indexOf(myId);
-
-        if (myIndex == -1 || sortedIds.size() == 1) {
-            return Optional.empty();
-        }
-
-        // Предыдущий по кольцу (с wraparound)
-        int leftIndex = (myIndex - 1 + sortedIds.size()) % sortedIds.size();
-        long leftId = sortedIds.get(leftIndex);
-
-        return Optional.ofNullable(nodes.get(leftId));
+    public Long getRightNeighbor() {
+        return rightNeighbor;
     }
 
-    /**
-     * Получение отсортированных ID узлов (включая себя).
-     */
-    private List<Long> getSortedNodeIds() {
-        List<Long> ids = new ArrayList<>(nodes.keySet());
-        ids.add(myId());
-        Collections.sort(ids);
-        return ids;
+    public long getMyNodeId() {
+        return myNodeId;
     }
 
-    /**
-     * Перестроение кольца (вызывается при изменении топологии).
-     */
-    private void rebuildRing() {
-        List<Long> sortedIds = getSortedNodeIds();
-        System.out.println("[RingState] Ring topology: " + sortedIds);
-
-        rightNeighbor().ifPresentOrElse(
-                right -> System.out.println("[RingState] Right neighbor: " + right.nodeId()),
-                () -> System.out.println("[RingState] No right neighbor")
-        );
-
-        leftNeighbor().ifPresentOrElse(
-                left -> System.out.println("[RingState] Left neighbor: " + left.nodeId()),
-                () -> System.out.println("[RingState] No left neighbor")
-        );
-    }
-
-    /**
-     * Генерация нового nodeId на основе timestamp и random.
-     */
-    private static long generateNodeId() {
-        return System.currentTimeMillis() + new Random().nextInt(10000);
-    }
-
-    /**
-     * Количество известных узлов (не считая себя).
-     */
-    public int nodeCount() {
+    public int getActiveNodeCount() {
         return nodes.size();
+    }
+
+    /**
+     * ДОБАВЛЕНО: Контейнер для пары ключей узла
+     */
+    public record NodeKeys(
+            PublicKey encryptionKey,
+            PublicKey signingKey
+    ) {
     }
 }
