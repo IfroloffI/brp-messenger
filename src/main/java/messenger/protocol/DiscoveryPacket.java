@@ -1,73 +1,138 @@
 package messenger.protocol;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.net.InetAddress;
-import java.nio.ByteBuffer;
+import java.net.UnknownHostException;
 
 /**
- * UDP пакет для автоматического обнаружения узлов.
- * <p>
- * Формат (16 байт):
- * - nodeId: 8 байт (long)
- * - IP address: 4 байта (IPv4)
- * - TCP port: 4 байта (int)
+ * UDP Discovery пакет с публичными ключами
+ * Формат: [nodeId:8][ipBytes:4][port:4][encKeyLen:4][encKey:variable][signKeyLen:4][signKey:variable]
  */
-public record DiscoveryPacket(
-        long nodeId,
-        InetAddress ipAddress,
-        int tcpPort
-) {
-    /**
-     * Сериализация в ByteBuffer.
-     *
-     * @return ByteBuffer готовый к отправке (position=0, limit=16)
-     */
-    public ByteBuffer toByteBuffer() {
-        byte[] ipBytes = ipAddress.getAddress();
+public class DiscoveryPacket {
+    private final long nodeId;
+    private final InetAddress address;
+    private final int port;
+    private final byte[] publicEncryptionKey;
+    private final byte[] publicSigningKey;
 
-        if (ipBytes.length != 4) {
-            throw new IllegalStateException("Only IPv4 is supported");
-        }
-
-        ByteBuffer buffer = ByteBuffer.allocate(16);
-        buffer.putLong(nodeId);
-        buffer.put(ipBytes);
-        buffer.putInt(tcpPort);
-
-        buffer.flip();
-        return buffer;
+    public DiscoveryPacket(long nodeId, InetAddress address, int port,
+                           byte[] publicEncryptionKey, byte[] publicSigningKey) {
+        this.nodeId = nodeId;
+        this.address = address;
+        this.port = port;
+        this.publicEncryptionKey = publicEncryptionKey;
+        this.publicSigningKey = publicSigningKey;
     }
 
     /**
-     * Десериализация из ByteBuffer.
-     *
-     * @param buffer ByteBuffer с данными (минимум 16 байт)
-     * @return DiscoveryPacket или null при ошибке
+     * Сериализует пакет в байты для отправки по UDP
      */
-    public static DiscoveryPacket fromByteBuffer(ByteBuffer buffer) {
-        try {
-            if (buffer.remaining() < 16) {
-                return null;
-            }
+    public byte[] serialize() throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(baos);
 
-            long nodeId = buffer.getLong();
+        // 1. Node ID (8 bytes)
+        dos.writeLong(nodeId);
 
-            byte[] ipBytes = new byte[4];
-            buffer.get(ipBytes);
-            InetAddress ipAddress = InetAddress.getByAddress(ipBytes);
+        // 2. IP address (4 bytes)
+        byte[] ipBytes = address.getAddress();
+        dos.write(ipBytes);
 
-            int tcpPort = buffer.getInt();
+        // 3. Port (4 bytes)
+        dos.writeInt(port);
 
-            return new DiscoveryPacket(nodeId, ipAddress, tcpPort);
-
-        } catch (Exception e) {
-            System.err.println("[DiscoveryPacket] Parse error: " + e.getMessage());
-            return null;
+        // 4. Encryption public key length + key
+        if (publicEncryptionKey != null) {
+            dos.writeInt(publicEncryptionKey.length);
+            dos.write(publicEncryptionKey);
+        } else {
+            dos.writeInt(0);
         }
+
+        // 5. Signing public key length + key
+        if (publicSigningKey != null) {
+            dos.writeInt(publicSigningKey.length);
+            dos.write(publicSigningKey);
+        } else {
+            dos.writeInt(0);
+        }
+
+        return baos.toByteArray();
+    }
+
+    /**
+     * Десериализует пакет из байтов
+     */
+    public static DiscoveryPacket deserialize(byte[] data) throws IOException {
+        ByteArrayInputStream bais = new ByteArrayInputStream(data);
+        DataInputStream dis = new DataInputStream(bais);
+
+        // 1. Node ID
+        long nodeId = dis.readLong();
+
+        // 2. IP address
+        byte[] ipBytes = new byte[4];
+        dis.readFully(ipBytes);
+        InetAddress address;
+        try {
+            address = InetAddress.getByAddress(ipBytes);
+        } catch (UnknownHostException e) {
+            throw new IOException("Invalid IP address in packet", e);
+        }
+
+        // 3. Port
+        int port = dis.readInt();
+
+        // 4. Encryption public key
+        int encKeyLen = dis.readInt();
+        byte[] encryptionKey = null;
+        if (encKeyLen > 0) {
+            encryptionKey = new byte[encKeyLen];
+            dis.readFully(encryptionKey);
+        }
+
+        // 5. Signing public key
+        int signKeyLen = dis.readInt();
+        byte[] signingKey = null;
+        if (signKeyLen > 0) {
+            signingKey = new byte[signKeyLen];
+            dis.readFully(signingKey);
+        }
+
+        return new DiscoveryPacket(nodeId, address, port, encryptionKey, signingKey);
+    }
+
+    // Getters
+
+    public long getNodeId() {
+        return nodeId;
+    }
+
+    public InetAddress getAddress() {
+        return address;
+    }
+
+    public int getPort() {
+        return port;
+    }
+
+    public byte[] getPublicEncryptionKey() {
+        return publicEncryptionKey;
+    }
+
+    public byte[] getPublicSigningKey() {
+        return publicSigningKey;
     }
 
     @Override
     public String toString() {
-        return String.format("DiscoveryPacket[nodeId=%d, ip=%s, port=%d]",
-                nodeId, ipAddress.getHostAddress(), tcpPort);
+        return String.format("DiscoveryPacket{nodeId=%d, address=%s, port=%d, encKeyLen=%d, signKeyLen=%d}",
+                nodeId, address.getHostAddress(), port,
+                publicEncryptionKey != null ? publicEncryptionKey.length : 0,
+                publicSigningKey != null ? publicSigningKey.length : 0);
     }
 }

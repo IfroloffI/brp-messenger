@@ -1,128 +1,135 @@
 package messenger.crypto;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.security.KeyPair;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
- * Хранилище криптографического ключа.
- * <p>
- * Ключ сохраняется в файловой системе: resources/crypto-keys/node.key
+ * Хранилище криптографических ключей на диске
+ * Генерирует и сохраняет 2 пары RSA ключей:
+ * - encryption: для шифрования/расшифровки сообщений
+ * - signing: для создания/проверки цифровых подписей
  */
-public final class KeyStorage {
+public class KeyStorage {
+    private static final Logger logger = Logger.getLogger(KeyStorage.class.getName());
 
-    private static final String KEY_DIR = "src/main/resources/crypto-keys";
-    private static final String KEY_FILE = "node.key";
-    private static final int EXPECTED_KEY_SIZE = 32; // AES-256: 32 bytes
+    private static final String ENCRYPTION_PRIVATE_KEY_FILE = "encryption_private.key";
+    private static final String ENCRYPTION_PUBLIC_KEY_FILE = "encryption_public.key";
+    private static final String SIGNING_PRIVATE_KEY_FILE = "signing_private.key";
+    private static final String SIGNING_PUBLIC_KEY_FILE = "signing_public.key";
 
-    private final Path keyFilePath;
+    private final Path keysDirectory;
+    private final KeyPairManager keyPairManager;
 
-    public KeyStorage() {
-        this.keyFilePath = Paths.get(KEY_DIR, KEY_FILE);
-        ensureDirectoryExists();
-    }
+    private KeyPair encryptionKeyPair;
+    private KeyPair signingKeyPair;
 
     /**
-     * Загрузка ключа из файла.
-     *
-     * @return Байты ключа или null если файл не существует
+     * @param keysDirectory директория для хранения ключей
      */
-    public byte[] loadKey() {
-        if (!Files.exists(keyFilePath)) {
-            return null;
-        }
+    public KeyStorage(Path keysDirectory) {
+        this.keysDirectory = keysDirectory;
+        this.keyPairManager = new KeyPairManager();
 
         try {
-            byte[] keyBytes = Files.readAllBytes(keyFilePath);
-
-            if (keyBytes.length != EXPECTED_KEY_SIZE) {
-                System.err.println("[KeyStorage] Invalid key size: " + keyBytes.length +
-                        " (expected " + EXPECTED_KEY_SIZE + ")");
-                return null;
-            }
-
-            return keyBytes;
-        } catch (IOException e) {
-            System.err.println("[KeyStorage] Failed to load key: " + e.getMessage());
-            return null;
+            Files.createDirectories(keysDirectory);
+            loadOrGenerateKeys();
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Failed to initialize KeyStorage", e);
+            throw new RuntimeException("Key storage initialization failed", e);
         }
     }
 
     /**
-     * Сохранение ключа в файл.
-     *
-     * @param keyBytes Байты ключа (должно быть 32 байта)
-     * @return true если успешно сохранён
+     * Загружает ключи с диска или генерирует новые, если их нет
      */
-    public boolean saveKey(byte[] keyBytes) {
-        if (keyBytes == null || keyBytes.length != EXPECTED_KEY_SIZE) {
-            System.err.println("[KeyStorage] Invalid key size for saving");
-            return false;
-        }
+    private void loadOrGenerateKeys() throws Exception {
+        Path encPrivPath = keysDirectory.resolve(ENCRYPTION_PRIVATE_KEY_FILE);
+        Path encPubPath = keysDirectory.resolve(ENCRYPTION_PUBLIC_KEY_FILE);
+        Path signPrivPath = keysDirectory.resolve(SIGNING_PRIVATE_KEY_FILE);
+        Path signPubPath = keysDirectory.resolve(SIGNING_PUBLIC_KEY_FILE);
 
-        try {
-            Files.write(keyFilePath, keyBytes);
+        boolean allKeysExist = Files.exists(encPrivPath) &&
+                Files.exists(encPubPath) &&
+                Files.exists(signPrivPath) &&
+                Files.exists(signPubPath);
 
-            // Установка прав доступа только для владельца (Unix-системы)
-            try {
-                java.nio.file.attribute.PosixFilePermissions.fromString("rw-------");
-                // На Windows это просто не сработает, но не критично
-            } catch (UnsupportedOperationException ignored) {
-                // Windows не поддерживает POSIX permissions
-            }
-
-            System.out.println("[KeyStorage] Key saved successfully");
-            return true;
-        } catch (IOException e) {
-            System.err.println("[KeyStorage] Failed to save key: " + e.getMessage());
-            return false;
+        if (allKeysExist) {
+            logger.info("Loading existing keys from " + keysDirectory);
+            loadKeys(encPrivPath, encPubPath, signPrivPath, signPubPath);
+        } else {
+            logger.info("Generating new key pairs (first run)");
+            generateAndSaveKeys(encPrivPath, encPubPath, signPrivPath, signPubPath);
         }
     }
 
     /**
-     * Получение пути к файлу ключа.
+     * Загружает ключи из файлов
      */
-    public String getKeyFilePath() {
-        return keyFilePath.toString();
+    private void loadKeys(Path encPrivPath, Path encPubPath, Path signPrivPath, Path signPubPath) throws Exception {
+        byte[] encPrivBytes = Files.readAllBytes(encPrivPath);
+        byte[] encPubBytes = Files.readAllBytes(encPubPath);
+        byte[] signPrivBytes = Files.readAllBytes(signPrivPath);
+        byte[] signPubBytes = Files.readAllBytes(signPubPath);
+
+        PrivateKey encryptionPrivate = keyPairManager.bytesToPrivateKey(encPrivBytes);
+        PublicKey encryptionPublic = keyPairManager.bytesToPublicKey(encPubBytes);
+        PrivateKey signingPrivate = keyPairManager.bytesToPrivateKey(signPrivBytes);
+        PublicKey signingPublic = keyPairManager.bytesToPublicKey(signPubBytes);
+
+        this.encryptionKeyPair = new KeyPair(encryptionPublic, encryptionPrivate);
+        this.signingKeyPair = new KeyPair(signingPublic, signingPrivate);
+
+        logger.info("Keys loaded successfully");
     }
 
     /**
-     * Проверка существования ключа.
+     * Генерирует новые ключи и сохраняет на диск
      */
-    public boolean keyExists() {
-        return Files.exists(keyFilePath);
+    private void generateAndSaveKeys(Path encPrivPath, Path encPubPath, Path signPrivPath, Path signPubPath) throws Exception {
+        KeyPairs keyPairs = keyPairManager.generateKeyPairs();
+
+        this.encryptionKeyPair = keyPairs.encryptionKeyPair();
+        this.signingKeyPair = keyPairs.signingKeyPair();
+
+        // Сохранение ключей шифрования
+        Files.write(encPrivPath, keyPairManager.privateKeyToBytes(encryptionKeyPair.getPrivate()));
+        Files.write(encPubPath, keyPairManager.publicKeyToBytes(encryptionKeyPair.getPublic()));
+
+        // Сохранение ключей подписи
+        Files.write(signPrivPath, keyPairManager.privateKeyToBytes(signingKeyPair.getPrivate()));
+        Files.write(signPubPath, keyPairManager.publicKeyToBytes(signingKeyPair.getPublic()));
+
+        logger.info("New key pairs generated and saved to " + keysDirectory);
     }
 
-    /**
-     * Удаление ключа (для тестирования).
-     */
-    public boolean deleteKey() {
-        try {
-            if (Files.exists(keyFilePath)) {
-                Files.delete(keyFilePath);
-                System.out.println("[KeyStorage] Key deleted");
-                return true;
-            }
-            return false;
-        } catch (IOException e) {
-            System.err.println("[KeyStorage] Failed to delete key: " + e.getMessage());
-            return false;
-        }
+    // === Getters ===
+
+    public PublicKey getEncryptionPublicKey() {
+        return encryptionKeyPair.getPublic();
     }
 
-    /**
-     * Создание директории для ключей если не существует.
-     */
-    private void ensureDirectoryExists() {
-        try {
-            Path dir = keyFilePath.getParent();
-            if (!Files.exists(dir)) {
-                Files.createDirectories(dir);
-                System.out.println("[KeyStorage] Created key directory: " + dir);
-            }
-        } catch (IOException e) {
-            System.err.println("[KeyStorage] Failed to create key directory: " + e.getMessage());
-        }
+    public PrivateKey getEncryptionPrivateKey() {
+        return encryptionKeyPair.getPrivate();
+    }
+
+    public PublicKey getSigningPublicKey() {
+        return signingKeyPair.getPublic();
+    }
+
+    public PrivateKey getSigningPrivateKey() {
+        return signingKeyPair.getPrivate();
+    }
+
+    public KeyPair getEncryptionKeyPair() {
+        return encryptionKeyPair;
+    }
+
+    public KeyPair getSigningKeyPair() {
+        return signingKeyPair;
     }
 }
