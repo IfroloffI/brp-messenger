@@ -113,9 +113,7 @@ public final class Main {
             });
 
             // 7. Установка callback для входящих сообщений
-            transport.setMessageReceivedCallback((message, decryptedContent) -> {
-                handleIncomingMessage(message, decryptedContent);
-            });
+            transport.setMessageReceivedCallback(Main::handleIncomingMessage);
 
             // 8. Запуск транспорта
             transport.start();
