@@ -1,7 +1,6 @@
 package ru.bauman.iu5.brp;
 
 import javafx.application.Application;
-import ru.bauman.iu5.brp.api.ApplicationApi;
 import ru.bauman.iu5.brp.api.dto.NetworkException;
 import ru.bauman.iu5.brp.api.mock.MockApplicationApi;
 import ru.bauman.iu5.brp.ui.MainWindow;

@@ -3,7 +3,6 @@ package ru.bauman.iu5.brp.ui;
 import javafx.application.Application;
 import javafx.scene.control.Label;
 import javafx.stage.Stage;
-import ru.bauman.iu5.brp.api.ApplicationApi;
 
 public class MainWindow extends Application {
     private static ApplicationApi sharedApi; // Статическое поле
