@@ -113,7 +113,7 @@ public final class BRPNodeApp {
             });
 
             // 7. Установка callback для входящих сообщений
-            transport.setMessageReceivedCallback(Main::handleIncomingMessage);
+            transport.setMessageReceivedCallback(BRPNodeApp::handleIncomingMessage);
 
             // 8. Запуск транспорта
             transport.start();

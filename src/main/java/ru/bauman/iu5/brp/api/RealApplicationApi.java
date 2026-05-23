@@ -1,17 +1,5 @@
 package ru.bauman.iu5.brp.api;
 
-import ru.bauman.iu5.brp.api.dto.*;
-import ru.bauman.iu5.brp.api.events.*;
-import ru.bauman.iu5.brp.crypto.*;
-import ru.bauman.iu5.brp.discovery.DiscoveryService;
-import ru.bauman.iu5.brp.nio.NioEventLoop;
-import ru.bauman.iu5.brp.protocol.ChatMessage;
-import ru.bauman.iu5.brp.protocol.MessageType;
-import ru.bauman.iu5.brp.ring.NodeInfo;
-import ru.bauman.iu5.brp.ring.RingState;
-import ru.bauman.iu5.brp.storage.*;
-import ru.bauman.iu5.brp.transport.RingTransport;
-
 import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,10 +8,51 @@ import java.security.KeyPair;
 import java.security.PublicKey;
 import java.sql.SQLException;
 import java.time.Instant;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import ru.bauman.iu5.brp.api.dto.ChatMessageDto;
+import ru.bauman.iu5.brp.api.dto.DeliveryStatus;
+import ru.bauman.iu5.brp.api.dto.ErrorSeverity;
+import ru.bauman.iu5.brp.api.dto.FileTransferDto;
+import ru.bauman.iu5.brp.api.dto.FileTransferStatus;
+import ru.bauman.iu5.brp.api.dto.NetworkError;
+import ru.bauman.iu5.brp.api.dto.NetworkException;
+import ru.bauman.iu5.brp.api.dto.NetworkStatistics;
+import ru.bauman.iu5.brp.api.dto.NodeDto;
+import ru.bauman.iu5.brp.api.dto.SignatureStatus;
+import ru.bauman.iu5.brp.api.events.ApplicationEvent;
+import ru.bauman.iu5.brp.api.events.ApplicationEventListener;
+import ru.bauman.iu5.brp.api.events.FileReceivedEvent;
+import ru.bauman.iu5.brp.api.events.FileSendStartedEvent;
+import ru.bauman.iu5.brp.api.events.FileTransferCancelledEvent;
+import ru.bauman.iu5.brp.api.events.FileTransferCompletedEvent;
+import ru.bauman.iu5.brp.api.events.FileTransferErrorEvent;
+import ru.bauman.iu5.brp.api.events.MessageDeliveredEvent;
+import ru.bauman.iu5.brp.api.events.MessageReceivedEvent;
+import ru.bauman.iu5.brp.api.events.NetworkErrorEvent;
+import ru.bauman.iu5.brp.api.events.NetworkStartedEvent;
+import ru.bauman.iu5.brp.api.events.NetworkStoppedEvent;
+import ru.bauman.iu5.brp.crypto.CryptoService;
+import ru.bauman.iu5.brp.crypto.KeyStorage;
+import ru.bauman.iu5.brp.discovery.DiscoveryService;
+import ru.bauman.iu5.brp.protocol.ChatMessage;
+import ru.bauman.iu5.brp.protocol.MessageType;
+import ru.bauman.iu5.brp.ring.NodeInfo;
+import ru.bauman.iu5.brp.ring.RingState;
+import ru.bauman.iu5.brp.storage.DeliveryTracker;
+import ru.bauman.iu5.brp.storage.MessageHistoryStore;
+import ru.bauman.iu5.brp.storage.OutboxStore;
+import ru.bauman.iu5.brp.transport.RingTransport;
 
 /**
  * Real implementation of ApplicationApi using the P2P network stack.
@@ -541,7 +570,7 @@ public class RealApplicationApi implements ApplicationApi {
             recentErrors.removeLast();
         }
         statistics.incrementTotalErrors();
-        fireEvent(new NetworkErrorEvent(severity, message, details));
+        fireEvent(new NetworkErrorEvent(severity, message, details, null));
     }
 
     private void addError(ErrorSeverity severity, String message) {
