@@ -60,7 +60,7 @@ public class MessageHistoryStore {
                 delivery_status VARCHAR(50) NOT NULL,
                 is_outgoing BOOLEAN NOT NULL,
                 is_read BOOLEAN DEFAULT FALSE,
-                created_at BIGINT DEFAULT CURRENT_TIMESTAMP
+                created_at BIGINT NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_peer ON message_history(sender_node_id, recipient_node_id);
             CREATE INDEX IF NOT EXISTS idx_timestamp ON message_history(timestamp DESC);
@@ -72,6 +72,12 @@ public class MessageHistoryStore {
                 if (!statement.trim().isEmpty()) {
                     stmt.execute(statement.trim());
                 }
+            }
+            // Миграция: убираем несовместимый DEFAULT CURRENT_TIMESTAMP
+            // у BIGINT-колонки из старых установок.
+            try {
+                stmt.execute("ALTER TABLE message_history ALTER COLUMN created_at SET DEFAULT 0");
+            } catch (SQLException ignored) {
             }
         } catch (SQLException e) {
             logger.log(Level.SEVERE, "Failed to create schema", e);
