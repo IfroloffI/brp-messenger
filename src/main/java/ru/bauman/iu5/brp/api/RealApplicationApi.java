@@ -237,7 +237,7 @@ public class RealApplicationApi implements ApplicationApi {
             transport.sendTextMessage(targetNodeId, text);
 
             // Save to history
-            ChatMessageDto dto = ChatMessageDto.outgoing(messageId, targetNodeId, Instant.now(), text);
+            ChatMessageDto dto = ChatMessageDto.outgoing(messageId, localNodeId, targetNodeId, Instant.now(), text);
             messageHistory.saveMessage(dto);
 
             // Fire event

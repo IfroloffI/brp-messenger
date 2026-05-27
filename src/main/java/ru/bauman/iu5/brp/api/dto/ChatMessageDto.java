@@ -36,13 +36,19 @@ public class ChatMessageDto {
     /**
      * Конструктор для исходящего сообщения.
      */
-    public static ChatMessageDto outgoing(String messageId, long targetNodeId, Instant timestamp, String text) {
-        ChatMessageDto dto = new ChatMessageDto(messageId, 0, // sender не важен для исходящих
+    public static ChatMessageDto outgoing(String messageId, long senderNodeId, long targetNodeId, Instant timestamp, String text) {
+        ChatMessageDto dto = new ChatMessageDto(messageId, senderNodeId,
                 targetNodeId, timestamp, text, SignatureStatus.NOT_APPLICABLE);
         dto.deliveryStatus = DeliveryStatus.SENT;
         dto.isOutgoing = true;
         dto.isRead = true; // свои сообщения всегда прочитаны
         return dto;
+    }
+
+    /** @deprecated use {@link #outgoing(String, long, long, Instant, String)} */
+    @Deprecated
+    public static ChatMessageDto outgoing(String messageId, long targetNodeId, Instant timestamp, String text) {
+        return outgoing(messageId, 0L, targetNodeId, timestamp, text);
     }
 
     public String getMessageId() {
