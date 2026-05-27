@@ -19,8 +19,8 @@ import ru.bauman.iu5.brp.api.dto.NodeDto;
 
 public class NetworkPanel extends VBox {
 	private final TextField localNameField = new TextField();
-	private final TextField portField = new TextField("5000");
-	private final CheckBox discoveryCheckBox = new CheckBox("UDP discovery");
+	private final TextField portField = new TextField("9877");
+	private final CheckBox discoveryCheckBox = new CheckBox("UDP discovery") {{ setSelected(true); }};
 	private final Label statusLabel = new Label("Сеть остановлена");
 	private final Label topologyLabel = new Label("-");
 	private final ListView<NodeDto> nodeList = new ListView<>();
