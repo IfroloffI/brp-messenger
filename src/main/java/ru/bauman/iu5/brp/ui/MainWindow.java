@@ -314,9 +314,14 @@ public class MainWindow extends Application {
 
         if (type == EventType.MESSAGE_RECEIVED) {
             MessageReceivedEvent received = (MessageReceivedEvent) event;
-            if (selectedNodeId != null && Objects.equals(selectedNodeId, received.getMessage().getSenderNodeId())) {
-                refreshConversation();
+            long senderId = received.getMessage().getSenderNodeId();
+            // Если ни один диалог не открыт — открываем диалог с отправителем,
+            // чтобы новое сообщение сразу было видно.
+            if (selectedNodeId == null) {
+                selectedNodeId = senderId;
             }
+            refreshNodes();
+            refreshConversation();
         }
 
         if (type == EventType.MESSAGE_DELIVERED || type == EventType.MESSAGE_SEND_ERROR) {
