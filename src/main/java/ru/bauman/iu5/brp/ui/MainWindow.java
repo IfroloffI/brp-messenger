@@ -331,6 +331,10 @@ public class MainWindow extends Application {
             refreshTransfers();
         }
 
+        if (type == EventType.FILE_RECEIVED) {
+            refreshTransfers();
+        }
+
         if (type == EventType.NETWORK_STARTED || type == EventType.NETWORK_STOPPED) {
             refreshStatus();
         }

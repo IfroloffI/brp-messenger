@@ -286,7 +286,6 @@ public class RealApplicationApi implements ApplicationApi {
                     transfer.setStatus(FileTransferStatus.COMPLETED);
 
                     fireEvent(new FileTransferCompletedEvent(transferId, fileName, true));
-                    activeTransfers.remove(transferId);
 
                 } catch (Exception e) {
                     logger.log(Level.WARNING, "File transfer error", e);
@@ -294,7 +293,6 @@ public class RealApplicationApi implements ApplicationApi {
                     transfer.setErrorMessage(e.getMessage());
 
                     fireEvent(new FileTransferErrorEvent(transferId, fileName, e.getMessage()));
-                    activeTransfers.remove(transferId);
                 }
             }).start();
 
@@ -312,7 +310,6 @@ public class RealApplicationApi implements ApplicationApi {
         if (transfer != null) {
             transfer.setStatus(FileTransferStatus.CANCELLED);
             fireEvent(new FileTransferCancelledEvent(transferId, transfer.getFileName()));
-            activeTransfers.remove(transferId);
         }
     }
 
@@ -551,7 +548,9 @@ public class RealApplicationApi implements ApplicationApi {
                         fileName,
                         decryptedContent.length
                 );
+                transfer.setBytesTransferred(decryptedContent.length);
                 transfer.setStatus(FileTransferStatus.COMPLETED);
+                activeTransfers.put(transferId, transfer);
                 fireEvent(new FileReceivedEvent(transferId, message.getSenderId(), fileName, decryptedContent.length, savePath));
             }
 
