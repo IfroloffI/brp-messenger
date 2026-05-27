@@ -102,6 +102,10 @@ public class ChatMessageDto {
         isRead = read;
     }
 
+    public void setOutgoing(boolean outgoing) {
+        isOutgoing = outgoing;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;

@@ -165,7 +165,12 @@ public class RingTransport implements AutoCloseable {
 
         if (channel.finishConnect()) {
             logger.info("Connected to " + channel.getRemoteAddress());
-            key.interestOps(SelectionKey.OP_READ);
+            Queue<ByteBuffer> queue = writeQueues.get(channel);
+            int interestOps = SelectionKey.OP_READ;
+            if (queue != null && !queue.isEmpty()) {
+                interestOps |= SelectionKey.OP_WRITE;
+            }
+            key.interestOps(interestOps);
         }
     }
 
@@ -510,6 +515,11 @@ public class RingTransport implements AutoCloseable {
             // Инициализируем буферы
             readBuffers.put(channel, ByteBuffer.allocate(BUFFER_SIZE));
             writeQueues.put(channel, new ArrayDeque<>());
+
+            SelectionKey key = channel.keyFor(selector);
+            if (key != null && key.isValid()) {
+                key.interestOps(SelectionKey.OP_READ);
+            }
 
             connections.put(nodeId, channel);
             logger.info("Connected to node " + nodeId + " at " + node.address() + ":" + node.port());

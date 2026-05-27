@@ -4,7 +4,6 @@ import java.nio.file.Path;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
-import java.util.Objects;
 import java.util.stream.Collectors;
 
 import javafx.animation.KeyFrame;
@@ -315,11 +314,9 @@ public class MainWindow extends Application {
         if (type == EventType.MESSAGE_RECEIVED) {
             MessageReceivedEvent received = (MessageReceivedEvent) event;
             long senderId = received.getMessage().getSenderNodeId();
-            // Если ни один диалог не открыт — открываем диалог с отправителем,
-            // чтобы новое сообщение сразу было видно.
-            if (selectedNodeId == null) {
-                selectedNodeId = senderId;
-            }
+            // Открываем диалог с отправителем, чтобы новое сообщение было видно сразу.
+            selectedNodeId = senderId;
+            api.markAsRead(senderId);
             refreshNodes();
             refreshConversation();
         }

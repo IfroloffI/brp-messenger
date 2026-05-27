@@ -1,17 +1,27 @@
 package ru.bauman.iu5.brp.storage;
 
-import ru.bauman.iu5.brp.api.dto.ChatMessageDto;
-import ru.bauman.iu5.brp.api.dto.DeliveryStatus;
-import ru.bauman.iu5.brp.api.dto.SignatureStatus;
-
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.sql.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import ru.bauman.iu5.brp.api.dto.ChatMessageDto;
+import ru.bauman.iu5.brp.api.dto.DeliveryStatus;
+import ru.bauman.iu5.brp.api.dto.SignatureStatus;
 
 /**
  * H2-backed persistent message history storage.
@@ -292,6 +302,7 @@ public class MessageHistoryStore {
 
         ChatMessageDto dto = new ChatMessageDto(messageId, senderId, recipientId, Instant.ofEpochMilli(timestamp), text, sigStatus);
         dto.setDeliveryStatus(delStatus);
+        dto.setOutgoing(isOutgoing);
         dto.setRead(isRead);
         return dto;
     }
