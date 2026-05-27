@@ -114,8 +114,16 @@ public class RealApplicationApi implements ApplicationApi {
             KeyStorage keyStorage = new KeyStorage(keysDir);
             cryptoService = new CryptoService(keyStorage);
 
-            // Register self in RingState
-            InetAddress localAddr = InetAddress.getLocalHost();
+            // Register self in RingState — use the IP of the interface that
+            // routes to the outside world, not getLocalHost() (which picks
+            // hostname/Hyper-V/WSL/VPN interfaces on Windows).
+            InetAddress localAddr;
+            try (java.net.DatagramSocket probe = new java.net.DatagramSocket()) {
+                probe.connect(InetAddress.getByName("8.8.8.8"), 80);
+                localAddr = probe.getLocalAddress();
+            } catch (Exception e) {
+                localAddr = InetAddress.getLocalHost();
+            }
             ringState.updateNode(new NodeInfo(
                     localNodeId,
                     localAddr,

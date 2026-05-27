@@ -4,8 +4,13 @@ import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
 import java.net.UnknownHostException;
 import java.security.PublicKey;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -95,18 +100,43 @@ public class DiscoveryService implements AutoCloseable {
             );
 
             byte[] data = packet.serialize();
-            DatagramPacket udpPacket = new DatagramPacket(
-                    data,
-                    data.length,
-                    InetAddress.getByName("255.255.255.255"),
-                    DISCOVERY_PORT
-            );
 
-            socket.send(udpPacket);
+            // Шлём subnet-directed broadcast на каждом IPv4-интерфейсе
+            // (limited broadcast 255.255.255.255 не работает на Wi-Fi-хотспотах
+            // и при наличии нескольких сетевых интерфейсов на Windows).
+            List<InetAddress> targets = collectBroadcastAddresses();
+            targets.add(InetAddress.getByName("255.255.255.255")); // на всякий случай
+
+            for (InetAddress target : targets) {
+                try {
+                    DatagramPacket udpPacket = new DatagramPacket(
+                            data, data.length, target, DISCOVERY_PORT);
+                    socket.send(udpPacket);
+                } catch (Exception e) {
+                    logger.log(Level.FINE, "Beacon send failed to " + target, e);
+                }
+            }
 
         } catch (Exception e) {
             logger.log(Level.WARNING, "Failed to send beacon", e);
         }
+    }
+
+    private static List<InetAddress> collectBroadcastAddresses() {
+        List<InetAddress> result = new ArrayList<>();
+        try {
+            Enumeration<NetworkInterface> ifs = NetworkInterface.getNetworkInterfaces();
+            while (ifs.hasMoreElements()) {
+                NetworkInterface ni = ifs.nextElement();
+                if (!ni.isUp() || ni.isLoopback() || ni.isVirtual()) continue;
+                for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    InetAddress bcast = ia.getBroadcast();
+                    if (bcast != null) result.add(bcast);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return result;
     }
 
     /**

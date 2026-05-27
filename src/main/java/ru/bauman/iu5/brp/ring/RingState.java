@@ -105,7 +105,9 @@ public class RingState {
      */
     private void recalculateNeighbors() {
         List<Long> sortedIds = new ArrayList<>(nodes.keySet());
-        sortedIds.add(myNodeId);
+        if (!sortedIds.contains(myNodeId)) {
+            sortedIds.add(myNodeId);
+        }
         Collections.sort(sortedIds);
 
         int myIndex = sortedIds.indexOf(myNodeId);
