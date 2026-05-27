@@ -156,10 +156,14 @@ public class DiscoveryService implements AutoCloseable {
                     }
                 }
 
+                // Используем адрес источника UDP-пакета: он надежнее, чем адрес из payload
+                // и не зависит от того, как именно нода определила свой локальный IP.
+                InetAddress sourceAddress = udpPacket.getAddress();
+
                 // Создаём NodeInfo с ключами
                 NodeInfo nodeInfo = new NodeInfo(
                         packet.getNodeId(),
-                        packet.getAddress(),
+                    sourceAddress != null ? sourceAddress : packet.getAddress(),
                         packet.getPort(),
                         System.currentTimeMillis(),
                         encryptionKey,  // ДОБАВЛЕНО

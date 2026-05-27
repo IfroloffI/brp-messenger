@@ -157,7 +157,7 @@ public class RealApplicationApi implements ApplicationApi {
             if (useUdpDiscovery) {
                 discoveryService = new DiscoveryService(
                         localNodeId,
-                        9876,
+                        9877,
                         ringState,
                         keyStorage
                 );
