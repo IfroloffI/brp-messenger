@@ -158,7 +158,9 @@ public class MainWindow extends Application {
         networkPanel.setNodes(visibleNodes);
 
         if (selectedNodeId != null && visibleNodes.stream().noneMatch(node -> node.getNodeId() == selectedNodeId)) {
-            selectedNodeId = null;
+            if (api.getMessageHistory(selectedNodeId, 1, 0).isEmpty()) {
+                selectedNodeId = null;
+            }
         }
     }
 
@@ -171,8 +173,10 @@ public class MainWindow extends Application {
 
         NodeDto selectedNode = api.getNodeById(selectedNodeId).orElse(null);
         if (selectedNode == null) {
-            chatPanel.setConversationTitle("Узел недоступен");
-            chatPanel.setMessages(List.of());
+            chatPanel.setConversationTitle("Node_" + selectedNodeId + " · unknown");
+            chatPanel.setMessages(api.getMessageHistory(selectedNodeId, 0, 0).stream()
+                    .map(this::formatMessage)
+                    .collect(Collectors.toList()));
             return;
         }
 
