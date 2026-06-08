@@ -53,6 +53,7 @@ import ru.bauman.iu5.brp.storage.DeliveryTracker;
 import ru.bauman.iu5.brp.storage.MessageHistoryStore;
 import ru.bauman.iu5.brp.storage.OutboxStore;
 import ru.bauman.iu5.brp.transport.RingTransport;
+import ru.bauman.iu5.brp.transport.TransportException;
 
 /**
  * Real implementation of ApplicationApi using the P2P network stack.
@@ -230,78 +231,86 @@ public class RealApplicationApi implements ApplicationApi {
     public String sendMessage(long targetNodeId, String text) throws NetworkException {
         if (!running) throw new NetworkException("Network is not running");
 
+        String messageId = UUID.randomUUID().toString();
+
         try {
-            String messageId = UUID.randomUUID().toString();
-
-            // Create and send
             transport.sendTextMessage(targetNodeId, text);
-
-            // Save to history
-            ChatMessageDto dto = ChatMessageDto.outgoing(messageId, localNodeId, targetNodeId, Instant.now(), text);
-            messageHistory.saveMessage(dto);
-
-            // Fire event
-            fireEvent(new MessageDeliveredEvent(messageId, targetNodeId));
-
-            return messageId;
-
+        } catch (TransportException e) {
+            logger.log(Level.WARNING, "Failed to send message to " + targetNodeId + ": " + e.getMessage());
+            addError(ErrorSeverity.ERROR, "Failed to send message: " + e.getMessage(), e.getMessage(), targetNodeId);
+            throw new NetworkException(ErrorSeverity.ERROR, e.getMessage(), e, targetNodeId);
         } catch (Exception e) {
             logger.log(Level.WARNING, "Failed to send message", e);
             addError(ErrorSeverity.ERROR, "Failed to send message", e.getMessage(), targetNodeId);
             throw new NetworkException(ErrorSeverity.ERROR, "Failed to send message", e, targetNodeId);
         }
+
+        // Only reach here when transport actually queued the frame
+        try {
+            ChatMessageDto dto = ChatMessageDto.outgoing(messageId, localNodeId, targetNodeId, Instant.now(), text);
+            messageHistory.saveMessage(dto);
+        } catch (Exception e) {
+            logger.log(Level.WARNING, "Failed to save outgoing message to history", e);
+        }
+
+        fireEvent(new MessageDeliveredEvent(messageId, targetNodeId));
+        return messageId;
     }
 
     @Override
     public String sendFile(long targetNodeId, Path filePath) throws NetworkException {
         if (!running) throw new NetworkException("Network is not running");
 
-        try {
-            // Validate
-            if (!Files.exists(filePath)) {
-                throw new IllegalArgumentException("File not found: " + filePath);
-            }
-            long fileSize = Files.size(filePath);
-            if (fileSize > 100 * 1024 * 1024) {
-                throw new IllegalArgumentException("File exceeds 100 MB limit");
-            }
-
-            String transferId = UUID.randomUUID().toString();
-            String fileName = filePath.getFileName().toString();
-
-            // Create transfer DTO
-            FileTransferDto transfer = FileTransferDto.outgoing(transferId, targetNodeId, fileName, fileSize);
-            activeTransfers.put(transferId, transfer);
-
-            // Fire start event
-            fireEvent(new FileSendStartedEvent(transferId, targetNodeId, fileName, fileSize));
-
-            // Send file asynchronously
-            new Thread(() -> {
-                try {
-                    byte[] fileData = Files.readAllBytes(filePath);
-                    transport.sendFile(targetNodeId, fileName, fileData);
-
-                    transfer.setBytesTransferred(fileData.length);
-                    transfer.setStatus(FileTransferStatus.COMPLETED);
-
-                    fireEvent(new FileTransferCompletedEvent(transferId, fileName, true));
-
-                } catch (Exception e) {
-                    logger.log(Level.WARNING, "File transfer error", e);
-                    transfer.setStatus(FileTransferStatus.ERROR);
-                    transfer.setErrorMessage(e.getMessage());
-
-                    fireEvent(new FileTransferErrorEvent(transferId, fileName, e.getMessage()));
-                }
-            }).start();
-
-            return transferId;
-
-        } catch (Exception e) {
-            logger.log(Level.WARNING, "Failed to send file", e);
-            throw new NetworkException(ErrorSeverity.ERROR, "Failed to send file", e, targetNodeId);
+        if (!Files.exists(filePath)) {
+            throw new NetworkException("File not found: " + filePath);
         }
+
+        long fileSize;
+        try {
+            fileSize = Files.size(filePath);
+        } catch (Exception e) {
+            throw new NetworkException("Cannot read file size: " + e.getMessage());
+        }
+
+        if (fileSize > 100 * 1024 * 1024) {
+            throw new NetworkException("File exceeds 100 MB limit");
+        }
+
+        String transferId = UUID.randomUUID().toString();
+        String fileName = filePath.getFileName().toString();
+
+        logger.info("sendFile invoked: " + fileName + " (" + fileSize + " bytes) -> node " + targetNodeId);
+
+        FileTransferDto transfer = FileTransferDto.outgoing(transferId, targetNodeId, fileName, fileSize);
+        activeTransfers.put(transferId, transfer);
+
+        fireEvent(new FileSendStartedEvent(transferId, targetNodeId, fileName, fileSize));
+
+        Thread t = new Thread(() -> {
+            try {
+                byte[] fileData = Files.readAllBytes(filePath);
+                transport.sendFile(targetNodeId, fileName, fileData);
+
+                transfer.setBytesTransferred(fileData.length);
+                transfer.setStatus(FileTransferStatus.COMPLETED);
+                fireEvent(new FileTransferCompletedEvent(transferId, fileName, true));
+
+            } catch (TransportException e) {
+                logger.log(Level.WARNING, "File transport failed for " + fileName + ": " + e.getMessage());
+                transfer.setStatus(FileTransferStatus.ERROR);
+                transfer.setErrorMessage(e.getMessage());
+                fireEvent(new FileTransferErrorEvent(transferId, fileName, e.getMessage()));
+            } catch (Exception e) {
+                logger.log(Level.WARNING, "File transfer error", e);
+                transfer.setStatus(FileTransferStatus.ERROR);
+                transfer.setErrorMessage(e.getMessage());
+                fireEvent(new FileTransferErrorEvent(transferId, fileName, e.getMessage()));
+            }
+        }, "brp-file-send-" + transferId);
+        t.setDaemon(true);
+        t.start();
+
+        return transferId;
     }
 
     @Override

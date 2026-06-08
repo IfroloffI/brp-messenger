@@ -36,7 +36,10 @@ public class RingTransport implements AutoCloseable {
     private static final Logger logger = Logger.getLogger(RingTransport.class.getName());
 
     private static final int TCP_PORT = 9877;
-    private static final int BUFFER_SIZE = 65536; // 64KB для больших сообщений
+    // Initial read-buffer size. Grows dynamically to accommodate large frames.
+    private static final int INITIAL_BUFFER_SIZE = 65536;
+    // Hard upper bound: reject frames larger than this (malformed/attack protection)
+    private static final int MAX_FRAME_SIZE = 32 * 1024 * 1024; // 32 MB
     private static final int CONNECT_TIMEOUT_MS = 5000;
 
     private final long myNodeId;
@@ -150,7 +153,7 @@ public class RingTransport implements AutoCloseable {
             channel.configureBlocking(false);
             channel.register(selector, SelectionKey.OP_READ);
 
-            readBuffers.put(channel, ByteBuffer.allocate(BUFFER_SIZE));
+            readBuffers.put(channel, ByteBuffer.allocate(INITIAL_BUFFER_SIZE));
             writeQueues.put(channel, new ArrayDeque<>());
 
             logger.info("Accepted connection from " + channel.getRemoteAddress());
@@ -175,21 +178,21 @@ public class RingTransport implements AutoCloseable {
     }
 
     /**
-     * Обработка чтения данных
+     * Обработка чтения данных.
+     * Буфер растёт динамически когда фрейм не помещается в текущий.
      */
     private void handleRead(SelectionKey key) throws IOException {
         SocketChannel channel = (SocketChannel) key.channel();
         ByteBuffer buffer = readBuffers.get(channel);
 
         if (buffer == null) {
-            buffer = ByteBuffer.allocate(BUFFER_SIZE);
+            buffer = ByteBuffer.allocate(INITIAL_BUFFER_SIZE);
             readBuffers.put(channel, buffer);
         }
 
         int bytesRead = channel.read(buffer);
 
         if (bytesRead == -1) {
-            // Соединение закрыто
             logger.info("Connection closed: " + channel.getRemoteAddress());
             cleanupChannel(channel);
             key.cancel();
@@ -198,40 +201,55 @@ public class RingTransport implements AutoCloseable {
         }
 
         if (bytesRead > 0) {
+            logger.fine("Read " + bytesRead + " bytes from " + channel.getRemoteAddress());
             buffer.flip();
 
-            // Пытаемся прочитать сообщения из буфера
             while (buffer.remaining() >= 4) {
                 buffer.mark();
                 int messageLength = buffer.getInt();
 
-                if (messageLength < 0 || messageLength > BUFFER_SIZE) {
-                    logger.warning("Invalid message length: " + messageLength);
+                if (messageLength < 0 || messageLength > MAX_FRAME_SIZE) {
+                    logger.warning("Invalid message length: " + messageLength + " from " + channel.getRemoteAddress() + " — closing channel");
                     cleanupChannel(channel);
                     key.cancel();
                     channel.close();
                     return;
                 }
 
+                // If the frame doesn't fit in the current buffer, grow it
+                if (messageLength > buffer.capacity() - 4) {
+                    int needed = messageLength + 4;
+                    logger.info("Growing read buffer from " + buffer.capacity() + " to " + needed + " bytes for frame from " + channel.getRemoteAddress());
+                    ByteBuffer bigger = ByteBuffer.allocate(needed);
+                    // reset to before the length prefix we already read
+                    buffer.reset();
+                    bigger.put(buffer);
+                    buffer = bigger;
+                    readBuffers.put(channel, buffer);
+                    buffer.flip();
+                    // re-read length prefix from new buffer
+                    buffer.mark();
+                    messageLength = buffer.getInt();
+                }
+
                 if (buffer.remaining() >= messageLength) {
-                    // Полное сообщение получено
                     byte[] messageData = new byte[messageLength];
                     buffer.get(messageData);
+                    logger.fine("Assembled frame: " + messageLength + " bytes from " + channel.getRemoteAddress());
 
                     try {
                         ChatMessage message = ChatMessage.deserialize(messageData);
                         handleIncomingMessage(message);
                     } catch (Exception e) {
-                        logger.log(Level.WARNING, "Failed to deserialize message", e);
+                        logger.log(Level.WARNING, "Failed to deserialize message from " + channel.getRemoteAddress(), e);
                     }
                 } else {
-                    // Неполное сообщение, возвращаемся назад
+                    // Incomplete frame — wait for more data
                     buffer.reset();
                     break;
                 }
             }
 
-            // Компактим буфер для следующего чтения
             buffer.compact();
         }
     }
@@ -263,28 +281,24 @@ public class RingTransport implements AutoCloseable {
     }
 
     /**
-     * Отправка текстового сообщения с шифрованием
+     * Отправка текстового сообщения с шифрованием.
+     * Бросает TransportException если отправка невозможна.
      */
-    public void sendTextMessage(long recipientId, String text) {
+    public void sendTextMessage(long recipientId, String text) throws TransportException {
+        PublicKey recipientEncryptionKey = ringState.getEncryptionPublicKey(recipientId);
+
+        if (recipientEncryptionKey == null) {
+            throw new TransportException("No encryption key for node " + recipientId + " — discovery may not have completed yet");
+        }
+
         try {
-            // Получаем публичный ключ шифрования получателя
-            PublicKey recipientEncryptionKey = ringState.getEncryptionPublicKey(recipientId);
-
-            if (recipientEncryptionKey == null) {
-                logger.warning("Cannot send message to " + recipientId + ": no encryption key available");
-                return;
-            }
-
-            // Шифруем контент и подписываем
             byte[] plainContent = text.getBytes(StandardCharsets.UTF_8);
             EncryptedMessage encrypted = cryptoService.encryptAndSign(plainContent, recipientEncryptionKey);
 
-            // Получаем свой публичный ключ подписи для передачи
             byte[] mySigningKeyBytes = keyPairManager.publicKeyToBytes(
                     cryptoService.getMySigningPublicKey()
             );
 
-            // Создаём сообщение
             ChatMessage message = new ChatMessage.Builder()
                     .messageId(messageIdGenerator.incrementAndGet())
                     .senderId(myNodeId)
@@ -303,24 +317,25 @@ public class RingTransport implements AutoCloseable {
                     recipientId, message.getMessageId(),
                     encrypted.signature() != null ? "yes" : "no"));
 
+        } catch (TransportException e) {
+            throw e;
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "Failed to send text message", e);
+            throw new TransportException("Failed to send text message to " + recipientId + ": " + e.getMessage(), e);
         }
     }
 
     /**
-     * Отправка файла с шифрованием
+     * Отправка файла с шифрованием.
+     * Бросает TransportException если отправка невозможна.
      */
-    public void sendFile(long recipientId, String fileName, byte[] fileData) {
+    public void sendFile(long recipientId, String fileName, byte[] fileData) throws TransportException {
+        PublicKey recipientEncryptionKey = ringState.getEncryptionPublicKey(recipientId);
+
+        if (recipientEncryptionKey == null) {
+            throw new TransportException("No encryption key for node " + recipientId + " — discovery may not have completed yet");
+        }
+
         try {
-            PublicKey recipientEncryptionKey = ringState.getEncryptionPublicKey(recipientId);
-
-            if (recipientEncryptionKey == null) {
-                logger.warning("Cannot send file to " + recipientId + ": no encryption key available");
-                return;
-            }
-
-            // Шифруем содержимое файла
             EncryptedMessage encrypted = cryptoService.encryptAndSign(fileData, recipientEncryptionKey);
 
             byte[] mySigningKeyBytes = keyPairManager.publicKeyToBytes(
@@ -345,48 +360,46 @@ public class RingTransport implements AutoCloseable {
             logger.info(String.format("Sent encrypted file to %d: %s (%d bytes, msg_id=%d)",
                     recipientId, fileName, fileData.length, message.getMessageId()));
 
+        } catch (TransportException e) {
+            throw e;
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "Failed to send file", e);
+            throw new TransportException("Failed to send file '" + fileName + "' to " + recipientId + ": " + e.getMessage(), e);
         }
     }
 
     /**
      * Внутренняя отправка сообщения в кольцо
      */
-    public void sendMessage(ChatMessage message) throws IOException {
+    public void sendMessage(ChatMessage message) throws TransportException, IOException {
         Long rightNeighbor = ringState.getRightNeighbor();
 
         if (rightNeighbor == null) {
-            logger.warning("No right neighbor, cannot send message (ring not formed)");
-            return;
+            throw new TransportException("No right neighbor — ring is not yet formed");
         }
 
         SocketChannel channel = getOrCreateConnection(rightNeighbor);
         if (channel == null) {
-            logger.warning("Cannot establish connection to right neighbor " + rightNeighbor);
-            return;
+            throw new TransportException("Cannot establish connection to right neighbor " + rightNeighbor);
         }
 
-        // Сериализуем сообщение
         byte[] data = message.serialize();
 
-        // Формируем буфер: [length:4][data:variable]
         ByteBuffer buffer = ByteBuffer.allocate(4 + data.length);
         buffer.putInt(data.length);
         buffer.put(data);
         buffer.flip();
 
-        // Добавляем в очередь на отправку
         Queue<ByteBuffer> queue = writeQueues.get(channel);
         if (queue != null) {
             queue.offer(buffer);
 
-            // Регистрируем интерес к записи
             SelectionKey key = channel.keyFor(selector);
             if (key != null && key.isValid()) {
                 key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
                 selector.wakeup();
             }
+        } else {
+            throw new TransportException("Write queue missing for channel to " + rightNeighbor);
         }
     }
 
@@ -395,12 +408,10 @@ public class RingTransport implements AutoCloseable {
      */
     private void handleIncomingMessage(ChatMessage message) {
         try {
-            // Проверка: это сообщение для меня?
             if (message.getRecipientId() == myNodeId) {
                 logger.info(String.format("Received message for me from %d (msg_id=%d, type=%s)",
                         message.getSenderId(), message.getMessageId(), message.getType()));
 
-                // Восстанавливаем публичный ключ подписи отправителя
                 PublicKey senderSigningKey = null;
                 if (message.getSenderPublicSigningKey() != null) {
                     try {
@@ -413,12 +424,11 @@ public class RingTransport implements AutoCloseable {
                 }
 
                 if (senderSigningKey == null) {
-                    logger.warning("Message from " + message.getSenderId() + " has no valid signing key");
+                    logger.warning("Message from " + message.getSenderId() + " has no valid signing key — dropping");
                     message.setSignatureStatus(SignatureStatus.MISSING);
                     return;
                 }
 
-                // Расшифровываем и верифицируем подпись
                 DecryptedMessage decrypted = cryptoService.decryptAndVerify(
                         message.getEncryptedContent(),
                         message.getEncryptedSessionKey(),
@@ -426,7 +436,6 @@ public class RingTransport implements AutoCloseable {
                         senderSigningKey
                 );
 
-                // Устанавливаем статус подписи
                 if (decrypted.signatureValid()) {
                     message.setSignatureStatus(SignatureStatus.VERIFIED);
                     logger.info("✓ Signature VERIFIED for message from " + message.getSenderId());
@@ -437,7 +446,6 @@ public class RingTransport implements AutoCloseable {
 
                 message.setDeliveryStatus(DeliveryStatus.DELIVERED);
 
-                // Обработка расшифрованного контента
                 if (message.getType() == MessageType.TEXT) {
                     String text = new String(decrypted.content(), StandardCharsets.UTF_8);
                     logger.info(String.format("┌─────────────────────────────────────"));
@@ -455,17 +463,20 @@ public class RingTransport implements AutoCloseable {
                     logger.info(String.format("└─────────────────────────────────────"));
                 }
 
-                // Вызываем callback если установлен
                 if (messageCallback != null) {
                     messageCallback.onMessageReceived(message, decrypted.content());
                 }
 
             } else {
-                // Не для меня - пересылаем дальше по кольцу (маршрутизация)
+                // Not for me — forward around the ring
                 if (message.getTtl() > 0) {
                     logger.fine(String.format("Forwarding message (msg_id=%d) to %d (ttl=%d)",
                             message.getMessageId(), message.getRecipientId(), message.getTtl()));
-                    sendMessage(message.withDecrementedTtl());
+                    try {
+                        sendMessage(message.withDecrementedTtl());
+                    } catch (Exception e) {
+                        logger.log(Level.WARNING, "Failed to forward message " + message.getMessageId(), e);
+                    }
                 } else {
                     logger.warning(String.format("Message TTL expired (msg_id=%d), dropping",
                             message.getMessageId()));
@@ -478,12 +489,23 @@ public class RingTransport implements AutoCloseable {
     }
 
     /**
-     * Получить или создать соединение с узлом
+     * Получить или создать соединение с узлом.
+     * Проверяет живость существующего канала перед возвратом.
      */
     private SocketChannel getOrCreateConnection(long nodeId) {
         SocketChannel existing = connections.get(nodeId);
-        if (existing != null && existing.isConnected()) {
-            return existing;
+        if (existing != null) {
+            if (existing.isOpen() && existing.isConnected() && !existing.socket().isClosed()) {
+                return existing;
+            }
+            // Stale channel — clean up and reconnect
+            logger.info("Stale connection to node " + nodeId + " detected, reconnecting");
+            cleanupChannel(existing);
+            try {
+                existing.close();
+            } catch (IOException e) {
+                // ignore
+            }
         }
 
         NodeInfo node = ringState.getNode(nodeId);
@@ -497,11 +519,9 @@ public class RingTransport implements AutoCloseable {
             channel.configureBlocking(false);
             channel.connect(new InetSocketAddress(node.address(), node.port()));
 
-            // Регистрируем для завершения подключения
             channel.register(selector, SelectionKey.OP_CONNECT);
             selector.wakeup();
 
-            // Ждём подключения (блокирующий режим для упрощения)
             long startTime = System.currentTimeMillis();
             while (!channel.finishConnect()) {
                 if (System.currentTimeMillis() - startTime > CONNECT_TIMEOUT_MS) {
@@ -512,8 +532,7 @@ public class RingTransport implements AutoCloseable {
                 Thread.sleep(10);
             }
 
-            // Инициализируем буферы
-            readBuffers.put(channel, ByteBuffer.allocate(BUFFER_SIZE));
+            readBuffers.put(channel, ByteBuffer.allocate(INITIAL_BUFFER_SIZE));
             writeQueues.put(channel, new ArrayDeque<>());
 
             SelectionKey key = channel.keyFor(selector);
@@ -538,8 +557,6 @@ public class RingTransport implements AutoCloseable {
     private void cleanupChannel(SocketChannel channel) {
         readBuffers.remove(channel);
         writeQueues.remove(channel);
-
-        // Удаляем из connections
         connections.entrySet().removeIf(entry -> entry.getValue() == channel);
     }
 
@@ -550,7 +567,6 @@ public class RingTransport implements AutoCloseable {
     public void close() {
         running = false;
 
-        // Закрываем все соединения
         connections.values().forEach(ch -> {
             try {
                 ch.close();
@@ -560,7 +576,6 @@ public class RingTransport implements AutoCloseable {
         });
         connections.clear();
 
-        // Закрываем server channel и selector
         try {
             if (serverChannel != null && serverChannel.isOpen()) {
                 serverChannel.close();
@@ -572,7 +587,6 @@ public class RingTransport implements AutoCloseable {
             logger.log(Level.WARNING, "Error closing transport", e);
         }
 
-        // Очищаем буферы
         readBuffers.clear();
         writeQueues.clear();
 
@@ -584,12 +598,6 @@ public class RingTransport implements AutoCloseable {
      */
     @FunctionalInterface
     public interface MessageReceivedCallback {
-        /**
-         * Вызывается при получении и расшифровке сообщения
-         *
-         * @param message          полученное сообщение (с метаданными и статусами)
-         * @param decryptedContent расшифрованное содержимое
-         */
         void onMessageReceived(ChatMessage message, byte[] decryptedContent);
     }
 }
