@@ -5,8 +5,6 @@ import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 import java.security.*;
-import java.security.spec.MGF1ParameterSpec;
-import java.security.spec.PSSParameterSpec;
 
 /**
  * High-level API для hybrid encryption (RSA + AES-GCM)
@@ -14,7 +12,7 @@ import java.security.spec.PSSParameterSpec;
 public class HybridCrypto {
     private static final String AES_ALGORITHM = "AES/GCM/NoPadding";
     private static final String RSA_ALGORITHM = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
-    private static final String SIGNATURE_ALGORITHM = "SHA256withRSA/PSS";
+    private static final String SIGNATURE_ALGORITHM = "SHA256withRSA";
     private static final int AES_KEY_SIZE = 256;
     private static final int GCM_TAG_LENGTH = 128;
     private static final int GCM_IV_LENGTH = 12;
@@ -55,8 +53,6 @@ public class HybridCrypto {
 
         // 4. Подпись исходного контента
         Signature signature = Signature.getInstance(SIGNATURE_ALGORITHM);
-        PSSParameterSpec pssSpec = new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1);
-        signature.setParameter(pssSpec);
         signature.initSign(senderSigningKey);
         signature.update(content);
         byte[] signatureBytes = signature.sign();
@@ -99,8 +95,6 @@ public class HybridCrypto {
         boolean signatureValid = false;
         try {
             Signature signature = Signature.getInstance(SIGNATURE_ALGORITHM);
-            PSSParameterSpec pssSpec = new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1);
-            signature.setParameter(pssSpec);
             signature.initVerify(senderSigningPublicKey);
             signature.update(content);
             signatureValid = signature.verify(signatureBytes);
