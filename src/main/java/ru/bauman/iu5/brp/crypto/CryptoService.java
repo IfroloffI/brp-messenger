@@ -36,8 +36,8 @@ public class CryptoService {
                     mySigningPrivateKey
             );
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "Failed to encrypt and sign message", e);
-            throw new CryptoException("Encryption failed", e);
+            logger.log(Level.SEVERE, "Failed to encrypt and sign message: " + e.getClass().getSimpleName() + ": " + e.getMessage(), e);
+            throw new CryptoException(e.getClass().getSimpleName() + ": " + e.getMessage(), e);
         }
     }
 

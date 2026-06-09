@@ -236,13 +236,15 @@ public class RealApplicationApi implements ApplicationApi {
         try {
             transport.sendTextMessage(targetNodeId, text);
         } catch (TransportException e) {
-            logger.log(Level.WARNING, "Failed to send message to " + targetNodeId + ": " + e.getMessage());
-            addError(ErrorSeverity.ERROR, "Failed to send message: " + e.getMessage(), e.getMessage(), targetNodeId);
-            throw new NetworkException(ErrorSeverity.ERROR, e.getMessage(), e, targetNodeId);
+            String rootMsg = rootCauseMessage(e);
+            logger.log(Level.WARNING, "Failed to send message to " + targetNodeId + ": " + rootMsg, e);
+            addError(ErrorSeverity.ERROR, "Failed to send message", rootMsg, targetNodeId);
+            throw new NetworkException(ErrorSeverity.ERROR, "Failed to send message: " + rootMsg, e, targetNodeId);
         } catch (Exception e) {
+            String rootMsg = rootCauseMessage(e);
             logger.log(Level.WARNING, "Failed to send message", e);
-            addError(ErrorSeverity.ERROR, "Failed to send message", e.getMessage(), targetNodeId);
-            throw new NetworkException(ErrorSeverity.ERROR, "Failed to send message", e, targetNodeId);
+            addError(ErrorSeverity.ERROR, "Failed to send message", rootMsg, targetNodeId);
+            throw new NetworkException(ErrorSeverity.ERROR, "Failed to send message: " + rootMsg, e, targetNodeId);
         }
 
         // Only reach here when transport actually queued the frame
@@ -591,5 +593,18 @@ public class RealApplicationApi implements ApplicationApi {
 
     private void addError(ErrorSeverity severity, String message) {
         addError(severity, message, null, null);
+    }
+
+    /** Walk the exception cause chain and return the deepest non-null message. */
+    private static String rootCauseMessage(Throwable t) {
+        String best = t.getMessage();
+        Throwable cause = t.getCause();
+        while (cause != null) {
+            if (cause.getMessage() != null && !cause.getMessage().isBlank()) {
+                best = cause.getClass().getSimpleName() + ": " + cause.getMessage();
+            }
+            cause = cause.getCause();
+        }
+        return best != null ? best : t.getClass().getSimpleName();
     }
 }
