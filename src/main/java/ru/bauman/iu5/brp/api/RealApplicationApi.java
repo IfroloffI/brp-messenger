@@ -533,7 +533,7 @@ public class RealApplicationApi implements ApplicationApi {
             String messageId = UUID.randomUUID().toString(); // Generate ID for UI
 
             if (message.getType() == MessageType.TEXT) {
-                String text = new String(decryptedContent);
+                String text = new String(decryptedContent, java.nio.charset.StandardCharsets.UTF_8);
                 ChatMessageDto dto = new ChatMessageDto(
                         messageId,
                         message.getSenderId(),
