@@ -5,5 +5,6 @@ package ru.bauman.iu5.brp.protocol;
  */
 public enum MessageType {
     TEXT,   // Текстовое сообщение
-    FILE    // Файл
+    FILE,   // Файл
+    HELLO   // Служебный фрейм идентификации при подключении (не шифруется, не пересылается)
 }

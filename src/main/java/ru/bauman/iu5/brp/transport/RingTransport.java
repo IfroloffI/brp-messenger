@@ -35,7 +35,7 @@ import ru.bauman.iu5.brp.ring.RingState;
 public class RingTransport implements AutoCloseable {
     private static final Logger logger = Logger.getLogger(RingTransport.class.getName());
 
-    private static final int TCP_PORT = 9877;
+    private static final int DEFAULT_TCP_PORT = 9877;
     // Initial read-buffer size. Grows dynamically to accommodate large frames.
     private static final int INITIAL_BUFFER_SIZE = 65536;
     // Hard upper bound: reject frames larger than this (malformed/attack protection)
@@ -43,6 +43,7 @@ public class RingTransport implements AutoCloseable {
     private static final int CONNECT_TIMEOUT_MS = 5000;
 
     private final long myNodeId;
+    private final int tcpPort;
     private final RingState ringState;
     private final CryptoService cryptoService;
     private final KeyPairManager keyPairManager;
@@ -63,7 +64,12 @@ public class RingTransport implements AutoCloseable {
     private MessageReceivedCallback messageCallback;
 
     public RingTransport(long myNodeId, RingState ringState, CryptoService cryptoService) {
+        this(myNodeId, DEFAULT_TCP_PORT, ringState, cryptoService);
+    }
+
+    public RingTransport(long myNodeId, int tcpPort, RingState ringState, CryptoService cryptoService) {
         this.myNodeId = myNodeId;
+        this.tcpPort = tcpPort;
         this.ringState = ringState;
         this.cryptoService = cryptoService;
         this.keyPairManager = new KeyPairManager();
@@ -83,7 +89,7 @@ public class RingTransport implements AutoCloseable {
         selector = Selector.open();
         serverChannel = ServerSocketChannel.open();
         serverChannel.configureBlocking(false);
-        serverChannel.bind(new InetSocketAddress(TCP_PORT));
+        serverChannel.bind(new InetSocketAddress(tcpPort));
         serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
         running = true;
@@ -93,7 +99,7 @@ public class RingTransport implements AutoCloseable {
         eventLoopThread.setDaemon(true);
         eventLoopThread.start();
 
-        logger.info("Ring transport started on TCP port " + TCP_PORT);
+        logger.info("Ring transport started on TCP port " + tcpPort);
     }
 
     /**
@@ -239,7 +245,7 @@ public class RingTransport implements AutoCloseable {
 
                     try {
                         ChatMessage message = ChatMessage.deserialize(messageData);
-                        handleIncomingMessage(message);
+                        handleIncomingMessage(channel, message);
                     } catch (Exception e) {
                         logger.log(Level.WARNING, "Failed to deserialize message from " + channel.getRemoteAddress(), e);
                     }
@@ -444,10 +450,24 @@ public class RingTransport implements AutoCloseable {
     }
 
     /**
-     * Обработка входящего сообщения с расшифровкой и верификацией
+     * Обработка входящего сообщения с расшифровкой и верификацией.
+     * channel передаётся для регистрации входящего соединения по HELLO.
      */
-    private void handleIncomingMessage(ChatMessage message) {
+    private void handleIncomingMessage(SocketChannel channel, ChatMessage message) {
         try {
+            // HELLO — служебный фрейм идентификации. Регистрируем входящий канал в connections,
+            // чтобы при отправке этому узлу переиспользовать уже открытое соединение (обходит
+            // асимметричные firewall-правила, когда входящие TCP заблокированы у удалённой ноды).
+            if (message.getType() == MessageType.HELLO) {
+                long senderId = message.getSenderId();
+                SocketChannel prev = connections.get(senderId);
+                if (prev == null || !prev.isOpen() || !prev.isConnected()) {
+                    connections.put(senderId, channel);
+                    logger.info("Registered accepted connection from node " + senderId);
+                }
+                return;
+            }
+
             if (message.getRecipientId() == myNodeId) {
                 logger.info(String.format("Received message for me from %d (msg_id=%d, type=%s)",
                         message.getSenderId(), message.getMessageId(), message.getType()));
@@ -584,11 +604,46 @@ public class RingTransport implements AutoCloseable {
             connections.put(nodeId, channel);
             logger.info("Connected to node " + nodeId + " at " + node.address() + ":" + node.port());
 
+            // Отправляем HELLO чтобы принимающая сторона могла зарегистрировать
+            // этот канал и использовать его для обратной отправки нам.
+            sendHello(channel);
+
             return channel;
 
         } catch (Exception e) {
             logger.log(Level.WARNING, "Failed to connect to node " + nodeId, e);
             return null;
+        }
+    }
+
+    /**
+     * Отправляет HELLO-фрейм по уже подключённому каналу (synchronous, блокирующий вызов только для маленького фрейма).
+     */
+    private void sendHello(SocketChannel channel) {
+        try {
+            ChatMessage hello = new ChatMessage.Builder()
+                    .messageId(messageIdGenerator.incrementAndGet())
+                    .senderId(myNodeId)
+                    .recipientId(0) // broadcast/служебное, recipientId не используется
+                    .type(MessageType.HELLO)
+                    .encryptedContent(new byte[0])
+                    .build();
+            byte[] data = hello.serialize();
+            ByteBuffer buf = ByteBuffer.allocate(4 + data.length);
+            buf.putInt(data.length);
+            buf.put(data);
+            buf.flip();
+            Queue<ByteBuffer> queue = writeQueues.get(channel);
+            if (queue != null) {
+                queue.offer(buf);
+                SelectionKey key = channel.keyFor(selector);
+                if (key != null && key.isValid()) {
+                    key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+                    selector.wakeup();
+                }
+            }
+        } catch (Exception e) {
+            logger.log(Level.WARNING, "Failed to send HELLO", e);
         }
     }
 

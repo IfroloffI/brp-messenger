@@ -141,7 +141,7 @@ public class RealApplicationApi implements ApplicationApi {
             outboxStore = new OutboxStore();
 
             // 5. Create RingTransport
-            transport = new RingTransport(localNodeId, ringState, cryptoService);
+            transport = new RingTransport(localNodeId, tcpPort, ringState, cryptoService);
             transport.setMessageReceivedCallback(this::handleIncomingMessage);
 
             // 6. Create DeliveryTracker with retry callback
@@ -158,6 +158,7 @@ public class RealApplicationApi implements ApplicationApi {
             // 7. Start transport
             transport.start();
             logger.info("RingTransport started on TCP port " + tcpPort);
+            logger.info("DiscoveryService will broadcast TCP port " + tcpPort);
 
             // 8. Start delivery tracker
             deliveryTracker.start();
@@ -166,7 +167,7 @@ public class RealApplicationApi implements ApplicationApi {
             if (useUdpDiscovery) {
                 discoveryService = new DiscoveryService(
                         localNodeId,
-                        9877,
+                        tcpPort,
                         ringState,
                         keyStorage,
                         () -> localNodeName
