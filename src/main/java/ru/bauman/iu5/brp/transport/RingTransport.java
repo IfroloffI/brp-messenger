@@ -268,7 +268,14 @@ public class RingTransport implements AutoCloseable {
 
         ByteBuffer buffer = queue.peek();
         if (buffer != null) {
-            channel.write(buffer);
+            try {
+                channel.write(buffer);
+            } catch (IOException e) {
+                cleanupChannel(channel);
+                key.cancel();
+                try { channel.close(); } catch (IOException ignored) {}
+                throw e;
+            }
 
             if (!buffer.hasRemaining()) {
                 queue.poll();
@@ -368,18 +375,51 @@ public class RingTransport implements AutoCloseable {
     }
 
     /**
-     * Внутренняя отправка сообщения в кольцо
+     * Внутренняя отправка сообщения в кольцо.
+     * Пробует правого соседа, затем левого, затем любую известную ноду.
      */
     public void sendMessage(ChatMessage message) throws TransportException, IOException {
         Long rightNeighbor = ringState.getRightNeighbor();
+        Long leftNeighbor = ringState.getLeftNeighbor();
 
-        if (rightNeighbor == null) {
+        if (rightNeighbor == null && leftNeighbor == null) {
             throw new TransportException("No right neighbor — ring is not yet formed");
         }
 
-        SocketChannel channel = getOrCreateConnection(rightNeighbor);
+        SocketChannel channel = null;
+        java.util.Set<Long> tried = new java.util.LinkedHashSet<>();
+
+        if (rightNeighbor != null) {
+            channel = getOrCreateConnection(rightNeighbor);
+            tried.add(rightNeighbor);
+            if (channel == null) {
+                logger.warning("Right neighbor " + rightNeighbor + " unreachable, trying left neighbor");
+            }
+        }
+
+        if (channel == null && leftNeighbor != null && !tried.contains(leftNeighbor)) {
+            channel = getOrCreateConnection(leftNeighbor);
+            tried.add(leftNeighbor);
+            if (channel == null) {
+                logger.warning("Left neighbor " + leftNeighbor + " unreachable, trying other known nodes");
+            }
+        }
+
         if (channel == null) {
-            throw new TransportException("Cannot establish connection to right neighbor " + rightNeighbor);
+            for (ru.bauman.iu5.brp.ring.NodeInfo node : ringState.getAllNodes()) {
+                long nodeId = node.nodeId();
+                if (nodeId == myNodeId || tried.contains(nodeId)) continue;
+                channel = getOrCreateConnection(nodeId);
+                tried.add(nodeId);
+                if (channel != null) {
+                    logger.info("Fallback: routing via node " + nodeId);
+                    break;
+                }
+            }
+        }
+
+        if (channel == null) {
+            throw new TransportException("Cannot deliver message: tried nodes " + tried + " — all unreachable");
         }
 
         byte[] data = message.serialize();
@@ -525,7 +565,8 @@ public class RingTransport implements AutoCloseable {
             long startTime = System.currentTimeMillis();
             while (!channel.finishConnect()) {
                 if (System.currentTimeMillis() - startTime > CONNECT_TIMEOUT_MS) {
-                    logger.warning("Connection timeout to node " + nodeId);
+                    logger.warning("Connection timeout to node " + nodeId
+                            + " (" + node.address().getHostAddress() + ":" + node.port() + ")");
                     channel.close();
                     return null;
                 }

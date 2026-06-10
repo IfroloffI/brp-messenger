@@ -37,16 +37,18 @@ public class RingState {
             NodeInfo existing = nodes.get(nodeInfo.nodeId());
 
             if (existing != null) {
-                // Обновляем timestamp и ключи (если они есть)
                 NodeInfo updated = existing.withUpdatedTimestamp(nodeInfo.lastSeen());
 
-                // Если пришли новые ключи, обновляем их
                 if (nodeInfo.hasKeys() && !existing.hasKeys()) {
                     updated = updated.withKeys(
                             nodeInfo.encryptionPublicKey(),
                             nodeInfo.signingPublicKey()
                     );
                     logger.info("Updated keys for node " + nodeInfo.nodeId());
+                }
+
+                if (nodeInfo.name() != null && !nodeInfo.name().isEmpty()) {
+                    updated = updated.withName(nodeInfo.name());
                 }
 
                 nodes.put(nodeInfo.nodeId(), updated);

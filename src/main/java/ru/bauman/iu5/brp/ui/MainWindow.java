@@ -73,7 +73,8 @@ public class MainWindow extends Application {
                 this::stopBackend,
                 this::refreshAll,
                 this::onNodeSelected,
-                node -> buildNodeLabel(node)
+                node -> buildNodeLabel(node),
+                name -> api.setLocalNodeName(name)
         );
         chatPanel = new ChatPanel(this::sendMessage);
         filePanel = new FilePanel(this::chooseFile, this::sendFile, this::cancelSelectedTransfer);
@@ -215,11 +216,11 @@ public class MainWindow extends Application {
 
     private String buildNodeLabel(NodeDto node) {
         int unread = api.getUnreadCount(node.getNodeId());
-        return node.getDisplayName() + " (" + node.getNodeId() + ")"
-                + " | " + node.getIpAddress() + ":" + node.getPort()
-                + (node.isOnline() ? " | online" : " | offline")
-                + (node.hasPublicKey() ? " | key" : " | no-key")
-                + (unread > 0 ? " | unread " + unread : "");
+        String label = node.getDisplayName();
+        if (unread > 0) {
+            label += " (" + unread + ")";
+        }
+        return label;
     }
 
     private String formatMessage(ChatMessageDto message) {

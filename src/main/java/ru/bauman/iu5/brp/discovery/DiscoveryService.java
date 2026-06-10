@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -36,19 +37,26 @@ public class DiscoveryService implements AutoCloseable {
     private final long myNodeId;
     private final int myTcpPort;
     private final RingState ringState;
-    private final KeyStorage keyStorage;  // ДОБАВЛЕНО
-    private final KeyPairManager keyPairManager;  // ДОБАВЛЕНО
+    private final KeyStorage keyStorage;
+    private final KeyPairManager keyPairManager;
+    private final Supplier<String> nameSupplier;
 
     private DatagramSocket socket;
     private ScheduledExecutorService scheduler;
     private volatile boolean running;
 
     public DiscoveryService(long myNodeId, int myTcpPort, RingState ringState, KeyStorage keyStorage) {
+        this(myNodeId, myTcpPort, ringState, keyStorage, () -> null);
+    }
+
+    public DiscoveryService(long myNodeId, int myTcpPort, RingState ringState, KeyStorage keyStorage,
+                            Supplier<String> nameSupplier) {
         this.myNodeId = myNodeId;
         this.myTcpPort = myTcpPort;
         this.ringState = ringState;
-        this.keyStorage = keyStorage;  // ДОБАВЛЕНО
-        this.keyPairManager = new KeyPairManager();  // ДОБАВЛЕНО
+        this.keyStorage = keyStorage;
+        this.keyPairManager = new KeyPairManager();
+        this.nameSupplier = nameSupplier;
     }
 
     /**
@@ -95,8 +103,9 @@ public class DiscoveryService implements AutoCloseable {
                     myNodeId,
                     localAddress,
                     myTcpPort,
-                    encryptionKeyBytes,  // ДОБАВЛЕНО
-                    signingKeyBytes       // ДОБАВЛЕНО
+                    encryptionKeyBytes,
+                    signingKeyBytes,
+                    nameSupplier.get()
             );
 
             byte[] data = packet.serialize();
@@ -190,14 +199,14 @@ public class DiscoveryService implements AutoCloseable {
                 // и не зависит от того, как именно нода определила свой локальный IP.
                 InetAddress sourceAddress = udpPacket.getAddress();
 
-                // Создаём NodeInfo с ключами
                 NodeInfo nodeInfo = new NodeInfo(
                         packet.getNodeId(),
-                    sourceAddress != null ? sourceAddress : packet.getAddress(),
+                        sourceAddress != null ? sourceAddress : packet.getAddress(),
                         packet.getPort(),
                         System.currentTimeMillis(),
-                        encryptionKey,  // ДОБАВЛЕНО
-                        signingKey      // ДОБАВЛЕНО
+                        encryptionKey,
+                        signingKey,
+                        packet.getNodeName()
                 );
 
                 // Обновляем состояние кольца

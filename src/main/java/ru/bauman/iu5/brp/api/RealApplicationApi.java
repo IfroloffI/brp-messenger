@@ -168,7 +168,8 @@ public class RealApplicationApi implements ApplicationApi {
                         localNodeId,
                         9877,
                         ringState,
-                        keyStorage
+                        keyStorage,
+                        () -> localNodeName
                 );
                 discoveryService.start();
                 logger.info("DiscoveryService started on UDP port 9876");
@@ -330,9 +331,11 @@ public class RealApplicationApi implements ApplicationApi {
 
         List<NodeDto> nodes = new ArrayList<>();
         for (NodeInfo info : ringState.getAllNodes()) {
+            String displayName = (info.name() != null && !info.name().isEmpty())
+                    ? info.name() : "Node_" + info.nodeId();
             NodeDto dto = new NodeDto(
                     info.nodeId(),
-                    "Node_" + info.nodeId(),
+                    displayName,
                     info.address().getHostAddress(),
                     info.port(),
                     !info.isExpired(System.currentTimeMillis(), 10000)
@@ -357,9 +360,11 @@ public class RealApplicationApi implements ApplicationApi {
         NodeInfo info = ringState.getNode(nodeId);
         if (info == null) return Optional.empty();
 
+        String displayName = (info.name() != null && !info.name().isEmpty())
+                ? info.name() : "Node_" + info.nodeId();
         NodeDto dto = new NodeDto(
                 info.nodeId(),
-                "Node_" + info.nodeId(),
+                displayName,
                 info.address().getHostAddress(),
                 info.port(),
                 !info.isExpired(System.currentTimeMillis(), 10000)

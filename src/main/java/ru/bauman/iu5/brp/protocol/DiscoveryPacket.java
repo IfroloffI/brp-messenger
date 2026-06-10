@@ -9,8 +9,8 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 
 /**
- * UDP Discovery пакет с публичными ключами
- * Формат: [nodeId:8][ipBytes:4][port:4][encKeyLen:4][encKey:variable][signKeyLen:4][signKey:variable]
+ * UDP Discovery пакет с публичными ключами и именем узла
+ * Формат: [nodeId:8][ipBytes:4][port:4][encKeyLen:4][encKey][signKeyLen:4][signKey][nameLen:4][name:UTF-8]
  */
 public class DiscoveryPacket {
     private final long nodeId;
@@ -18,14 +18,21 @@ public class DiscoveryPacket {
     private final int port;
     private final byte[] publicEncryptionKey;
     private final byte[] publicSigningKey;
+    private final String nodeName;
 
     public DiscoveryPacket(long nodeId, InetAddress address, int port,
                            byte[] publicEncryptionKey, byte[] publicSigningKey) {
+        this(nodeId, address, port, publicEncryptionKey, publicSigningKey, null);
+    }
+
+    public DiscoveryPacket(long nodeId, InetAddress address, int port,
+                           byte[] publicEncryptionKey, byte[] publicSigningKey, String nodeName) {
         this.nodeId = nodeId;
         this.address = address;
         this.port = port;
         this.publicEncryptionKey = publicEncryptionKey;
         this.publicSigningKey = publicSigningKey;
+        this.nodeName = nodeName;
     }
 
     /**
@@ -57,6 +64,15 @@ public class DiscoveryPacket {
         if (publicSigningKey != null) {
             dos.writeInt(publicSigningKey.length);
             dos.write(publicSigningKey);
+        } else {
+            dos.writeInt(0);
+        }
+
+        // 6. Node name (UTF-8)
+        if (nodeName != null && !nodeName.isEmpty()) {
+            byte[] nameBytes = nodeName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            dos.writeInt(nameBytes.length);
+            dos.write(nameBytes);
         } else {
             dos.writeInt(0);
         }
@@ -103,7 +119,18 @@ public class DiscoveryPacket {
             dis.readFully(signingKey);
         }
 
-        return new DiscoveryPacket(nodeId, address, port, encryptionKey, signingKey);
+        // 6. Node name (optional — older packets may not have this field)
+        String nodeName = null;
+        if (dis.available() >= 4) {
+            int nameLen = dis.readInt();
+            if (nameLen > 0) {
+                byte[] nameBytes = new byte[nameLen];
+                dis.readFully(nameBytes);
+                nodeName = new String(nameBytes, java.nio.charset.StandardCharsets.UTF_8);
+            }
+        }
+
+        return new DiscoveryPacket(nodeId, address, port, encryptionKey, signingKey, nodeName);
     }
 
     // Getters
@@ -126,6 +153,10 @@ public class DiscoveryPacket {
 
     public byte[] getPublicSigningKey() {
         return publicSigningKey;
+    }
+
+    public String getNodeName() {
+        return nodeName;
     }
 
     @Override

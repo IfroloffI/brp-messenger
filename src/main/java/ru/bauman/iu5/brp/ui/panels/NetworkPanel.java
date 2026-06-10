@@ -25,7 +25,7 @@ public class NetworkPanel extends VBox {
 	private final Label topologyLabel = new Label("-");
 	private final ListView<NodeDto> nodeList = new ListView<>();
 
-	public NetworkPanel(Runnable onStart, Runnable onStop, Runnable onRefresh, Consumer<NodeDto> onNodeSelected, Function<NodeDto, String> nodeTextFactory) {
+	public NetworkPanel(Runnable onStart, Runnable onStop, Runnable onRefresh, Consumer<NodeDto> onNodeSelected, Function<NodeDto, String> nodeTextFactory, Consumer<String> onLocalNameChanged) {
 		getStyleClass().add("network-panel");
 		setSpacing(8);
 		setPadding(new Insets(12));
@@ -36,6 +36,7 @@ public class NetworkPanel extends VBox {
 
 		localNameField.setPromptText("Локальное имя");
 		localNameField.setText("Node");
+		localNameField.textProperty().addListener((obs, oldVal, newVal) -> onLocalNameChanged.accept(newVal));
 
 		HBox controls = new HBox(8, new Label("Port:"), portField, discoveryCheckBox);
 		HBox.setHgrow(portField, Priority.ALWAYS);
